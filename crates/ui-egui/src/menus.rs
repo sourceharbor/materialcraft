@@ -23,6 +23,21 @@ const fn sep(menu: &'static str) -> MenuItem {
 
 pub const TOP: [&str; 5] = ["File", "Edit", "Tools", "Windows", "Help"];
 
+pub(crate) const EXPLORER_NEW: &[(&str, &str)] = &[("Graph", "ui.newGraph"), ("Function Graph", "ui.newFunctionGraph"), ("Folder", "folder.create")];
+pub(crate) const EXPLORER_PACKAGE: &[(&str, &str)] = &[
+    ("Reload", "file.reload"),
+    ("Save", "file.save"),
+    ("Save As", "file.saveAs"),
+    ("Save A Copy As", "file.saveCopyAs"),
+    ("Copy", "explorer.copy"),
+    ("Paste", "explorer.paste"),
+    ("Close", "package.close"),
+];
+pub(crate) const EXPLORER_FOLDER: &[(&str, &str)] =
+    &[("Copy", "explorer.copy"), ("Paste", "explorer.paste"), ("Rename", "folder.rename"), ("Remove", "folder.remove")];
+pub(crate) const EXPLORER_GRAPH: &[(&str, &str)] =
+    &[("Open", "graph.open"), ("Copy", "explorer.copy"), ("Paste", "explorer.paste"), ("Remove", "graph.delete"), ("Rename", "graph.rename")];
+
 /// The menu catalog (the target menu tree with our ids)
 pub const CATALOG: &[MenuItem] = &[
     sub("File", "New", "Graph...", "ui.newGraph", Some("Ctrl+N")),
@@ -88,6 +103,8 @@ pub const CATALOG: &[MenuItem] = &[
     it("Help", "ArtCraft website...", "ui.help.website", None),
     it("Help", "Report a bug...", "ui.help.bug", None),
     sep("Help"),
+    #[cfg(not(target_arch = "wasm32"))]
+    it("Help", "Check for updates...", "ui.help.checkForUpdates", None),
     it("Help", "About MaterialCraft...", "ui.about", None),
 ];
 
@@ -97,6 +114,10 @@ fn is_ui(id: &str) -> bool {
 
 /// Whether an item can run now
 pub fn enabled(app: &MaterialCraftApp, id: &str) -> bool {
+    if let Some(enabled) = crate::history::enabled(app, id) {
+        return enabled;
+    }
+
     if let Some(enabled) = crate::graph::editor_actions::enabled(app, id) {
         return enabled;
     }
@@ -150,8 +171,10 @@ pub fn invoke(app: &mut MaterialCraftApp, ctx: &egui::Context, id: &str) {
         "ui.preferences" => app.ui.windows.preferences = true,
         "ui.view.graph" => {}
         "ui.resetLayout" => app.ui.dock = crate::docking::Dock::default(),
-        // These replace the open package: ask first when it has unsaved changes.
-        "ui.closeAll" | "file.newPackage" => crate::unsaved::guard(app, crate::unsaved::Guarded::Menu { id: id.to_string() }),
+        "ui.closeAll" => crate::unsaved::guard(app, crate::unsaved::Guarded::Menu { id: id.to_string() }),
+        "file.newPackage" => {
+            app.run("file.newPackage", serde_json::json!({}));
+        }
         "ui.reloadResources" | "ui.clearCache" => {
             if let Ok(mut c) = app.session.cache.lock() {
                 c.clear();
@@ -161,6 +184,8 @@ pub fn invoke(app: &mut MaterialCraftApp, ctx: &egui::Context, id: &str) {
         "ui.home" => app.ui.windows.home = true,
         "ui.help.shortcuts" => app.ui.windows.shortcuts = true,
         "ui.about" => app.ui.windows.about = true,
+        #[cfg(not(target_arch = "wasm32"))]
+        "ui.help.checkForUpdates" => crate::updates_ui::check(app),
         "ui.help.discord" => ctx.open_url(egui::OpenUrl::new_tab("https://discord.gg/artcraft")),
         "ui.help.website" => ctx.open_url(egui::OpenUrl::new_tab("https://getartcraft.com/apps/materialcraft")),
         "ui.help.docs" => ctx.open_url(egui::OpenUrl::new_tab("https://github.com/storytold/materialcraft#readme")),
@@ -274,18 +299,15 @@ pub fn shortcuts(app: &mut MaterialCraftApp, ctx: &egui::Context) {
     if ctx.egui_wants_keyboard_input() || egui::Popup::is_any_open(ctx) {
         return;
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::updates_ui::blocks_input(app) {
+        return;
+    }
     if !ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))) {
         return;
     }
 
-    // Selected wires handle deletion and swapping before nodes
-    if crate::graph::editor_target::EditorTarget::resolve(app) == crate::graph::editor_target::EditorTarget::Material && !app.graph.selected_wires.is_empty() {
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete) | i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)) {
-            crate::graph::delete_selected_wires(app);
-        } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::X)) {
-            crate::graph::swap_selected_wires(app);
-        }
-    }
+    crate::graph::wire_actions::shortcuts(app, ctx);
 
     let mut table: Vec<(&'static str, KeyboardShortcut)> = CATALOG.iter().filter_map(|i| Some((i.id, parse_shortcut(i.shortcut?)?))).collect();
     for c in materialcraft_engine::command_specs() {
@@ -308,7 +330,9 @@ pub fn shortcuts(app: &mut MaterialCraftApp, ctx: &egui::Context) {
         }
     });
     for id in fire {
-        invoke(app, ctx, id);
+        if crate::graph::editor_actions::shortcut_enabled(app, id) {
+            invoke(app, ctx, id);
+        }
     }
 }
 

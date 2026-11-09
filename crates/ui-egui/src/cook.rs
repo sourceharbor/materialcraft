@@ -13,7 +13,11 @@ use crate::MaterialCraftApp;
 /// the app (and unsaved work) down
 pub fn guard<T>(what: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|p| {
-        let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
+        let msg = p
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| p.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic payload".to_string());
         Err(format!("internal error in {what}: {msg}"))
     })
 }
@@ -120,6 +124,7 @@ fn start(app: &mut MaterialCraftApp, now: f64) {
     s.dirty = false;
     let pkg = s.pkg.clone();
     let (gi, max) = (s.graph, s.preview_size);
+    let environment = s.environment;
     let materials = s.material_preview.graphs();
     let cache = s.cache.clone();
     let epoch = s.cook_epoch;
@@ -130,6 +135,7 @@ fn start(app: &mut MaterialCraftApp, now: f64) {
     use materialcraft_engine::eval::Options;
     let spawned = std::thread::Builder::new().name("materialcraft-cook".into()).spawn(move || {
         let mut opts = Options::new(&dec);
+        opts.environment = environment;
         opts.max_size = max;
         opts.cancel = Some(&thread_flag);
         let cooked = guard("cook", || Ok(PreviewCook::run(&pkg, gi, &materials, &opts, &cache)));

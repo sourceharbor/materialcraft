@@ -9,11 +9,13 @@ pub fn session(s: &Session, graph: Option<usize>) -> J {
     let g = s.pkg.graphs.get(gi);
     let cooked = (gi == s.graph).then_some(&s.cooked);
     let graph_json = g.map(|g| {
-        json!({
+        let mut result = json!({
             "index": gi,
             "name": g.name,
+            "path": g.sbs_path(),
             "kind": g.kind(),
             "function": g.function,
+            "functionWarnings": crate::function_inspection::warnings(g).into_iter().map(|(target, messages)| json!({"target": target, "messages": messages})).collect::<Vec<_>>(),
             "size": g.size_px(),
             "format": g.format,
             "seed": g.seed,
@@ -29,6 +31,7 @@ pub fn session(s: &Session, graph: Option<usize>) -> J {
                 json!({
                     "id": n.id.0,
                     "def": n.def,
+                    "instance": n.instance,
                     "label": if n.label.is_empty() { materialcraft_nodes::find(&n.def).map_or(n.def.as_str(), |d| d.label).to_string() } else { n.label.clone() },
                     "pos": n.pos,
                     "params": n.params,
@@ -52,11 +55,18 @@ pub fn session(s: &Session, graph: Option<usize>) -> J {
             "frames": g.frames,
             "comments": g.comments,
             "pins": g.pins,
-        })
+        });
+        result["physicalSize"] = json!(g.physical_size);
+        result["pixelRatio"] = json!(g.pixel_ratio);
+        result["pixelRatioMode"] = json!(g.pixel_ratio_mode);
+        result["tiling"] = json!(g.tiling);
+        result["tilingMode"] = json!(g.tiling_mode);
+        result
     });
     json!({
-        "package": {"name": s.pkg.name, "path": s.path, "modified": s.modified, "warnings": s.load_warnings, "resources": s.pkg.resources.iter().map(|r| json!({"name": r.name, "bytes": r.bytes.len()})).collect::<Vec<_>>()},
-        "graphs": s.pkg.graphs.iter().enumerate().map(|(i, g)| json!({"index": i, "name": g.name, "nodes": g.nodes.len(), "kind": g.kind()})).collect::<Vec<_>>(),
+        "documents": s.inspect_documents(),
+        "package": {"name": s.pkg.name, "path": s.path, "modified": s.modified, "folders": s.pkg.folder_paths(), "warnings": s.load_warnings, "resources": s.pkg.resources.iter().map(|r| json!({"name": r.name, "bytes": r.bytes.len()})).collect::<Vec<_>>()},
+        "graphs": s.pkg.graphs.iter().enumerate().map(|(i, g)| json!({"index": i, "name": g.name, "path": g.sbs_path(), "nodes": g.nodes.len(), "kind": g.kind()})).collect::<Vec<_>>(),
         "openGraph": s.graph,
         "graph": graph_json,
         "annotationSelection": s.annotation_selection,
@@ -72,9 +82,11 @@ pub fn session(s: &Session, graph: Option<usize>) -> J {
         },
         "previewSize": s.preview_size,
         "camera": s.camera,
+        "environment": s.environment,
         "cookMs": s.cooked.ms,
         "dirty": s.dirty,
         "history": s.history(),
+        "historyPreferences": s.history_prefs,
         "canUndo": s.can_undo(),
         "canRedo": s.can_redo(),
         "log": s.log.iter().rev().take(20).collect::<Vec<_>>(),

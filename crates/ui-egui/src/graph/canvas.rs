@@ -14,6 +14,11 @@ use materialcraft_engine::core::NodeId;
 
 /// The graph panel: toolbar row and canvas
 pub fn show(app: &mut MaterialCraftApp, ui: &mut Ui) {
+    if ui.rect_contains_pointer(ui.available_rect_before_wrap()) && ui.input(|input| input.pointer.primary_pressed() || input.pointer.secondary_pressed()) {
+        crate::properties::GraphPropertyDraft::commit(app);
+        app.inspected_graph = None;
+    }
+
     app.reconcile_editors();
     if !crate::pattern::active(app) {
         app.pattern_editor = None;
@@ -75,10 +80,7 @@ fn canvas(app: &mut MaterialCraftApp, ui: &mut Ui) {
 
     let mut layouts: Vec<NodeLayout> = Vec::with_capacity(graph.nodes.len());
     for node in &graph.nodes {
-        let (mut ins, outs) = materialcraft_engine::eval::ports_with_connections(&app.session.pkg, node, index.incoming(node.id).iter().copied());
-        let visible =
-            super::input_visibility::count(ins.iter().map(|port| index.input_of(node.id, &port.id).is_some()), if node.def == "fx_map" { 2 } else { 1 });
-        ins.truncate(visible);
+        let (ins, outs) = materialcraft_engine::eval::ports_with_connections(&app.session.pkg, node, index.incoming(node.id).iter().copied());
         let mut r = node_rect(node, ins.len(), outs.len(), show_thumbnails);
         if selection.contains(&node.id) && node_delta.length() > 0.5 {
             let position = materialcraft_engine::graph_grid::translate(node.pos, node_delta.into(), app.ui.prefs.snap_to_grid);
@@ -164,13 +166,15 @@ fn canvas(app: &mut MaterialCraftApp, ui: &mut Ui) {
         let picked = app.graph.selected_wires.contains(w);
         let hovered = wire_hover.as_ref() == Some(w);
         let base = (2.0 * camera.zoom).clamp(1.0, 3.0);
-        let stroke = if picked {
-            Stroke::new(base + 2.0, theme.accent)
-        } else if hovered {
-            Stroke::new(base + 1.0, Color32::WHITE)
+        let width = if hovered && !picked { base + 1.0 } else { base };
+        let color = if hovered {
+            Color32::WHITE
+        } else if hot {
+            theme.accent
         } else {
-            Stroke::new(base, if hot { theme.accent } else { Color32::from_gray(0xb4) })
+            Color32::from_gray(0xb4)
         };
+        let stroke = super::wire_selection::stroke(picked, width, color, theme.accent);
 
         painter.add(egui::epaint::CubicBezierShape::from_points_stroke(*ctrl, false, Color32::TRANSPARENT, stroke));
     }
@@ -180,6 +184,7 @@ fn canvas(app: &mut MaterialCraftApp, ui: &mut Ui) {
     let font = FontId::proportional((10.5 * camera.zoom).clamp(6.0, 16.0));
     let small = FontId::proportional((9.0 * camera.zoom).clamp(5.5, 13.0));
     let mut node_responses: Vec<(NodeId, egui::Response)> = Vec::new();
+    let mut dot_grabs: Vec<Rect> = Vec::new();
     for layout in &layouts {
         let Some(node) = index.node(layout.id) else { continue };
 
@@ -190,7 +195,12 @@ fn canvas(app: &mut MaterialCraftApp, ui: &mut Ui) {
         let selected = selection.contains(&node.id);
         let result = cooked.nodes.get(&node.id);
         let error = result.and_then(|r| r.error.as_ref());
-        let resp = ui.interact(screen_rect, ui.scope_id().with(("node", node.id.0)), Sense::click_and_drag());
+        // A dot is tiny, so its grab area keeps a minimum on-screen size
+        let grab = if node.def == "dot" { node_card::dot_grab(screen_rect) } else { screen_rect };
+        if node.def == "dot" {
+            dot_grabs.push(grab);
+        }
+        let resp = ui.interact(grab, ui.scope_id().with(("node", node.id.0)), Sense::click_and_drag());
         crate::widgets::name(&resp, egui::Role::Button, &node_label(node));
         if node.def == "dot" {
             node_card::paint_dot(&painter, screen_rect, if selected { theme.accent } else { Color32::from_gray(0xb4) });
@@ -269,7 +279,8 @@ fn canvas(app: &mut MaterialCraftApp, ui: &mut Ui) {
     super::annotation_canvas::pins(app, ui, &graph.pins, &camera);
 
     // Ports (drawn last, interactable over the node cards)
-    let port_hover = pointer.and_then(|p| nearest_port(&app.graph.ports, p, 9.0)).cloned();
+    // except on a dot's body: its port hit circles would otherwise cover it and it could never be moved
+    let port_hover = pointer.filter(|p| !dot_grabs.iter().any(|grab| grab.contains(*p))).and_then(|p| nearest_port(&app.graph.ports, p, 9.0)).cloned();
     for h in &app.graph.ports {
         if !rect.contains(h.pos) {
             continue;

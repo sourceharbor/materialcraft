@@ -134,6 +134,45 @@ fn standalone_function_canvas_wires_constants_and_marks_an_output() {
 }
 
 #[test]
+fn embedded_graphs_open_with_control_e_but_not_double_click() {
+    for definition in ["fx_map", "pixel_processor", "value_processor"] {
+        let mut frames = Frames::new(new_session());
+        let node = NodeId(frames.app.run("graph.node.add", json!({"def": definition})).unwrap()["id"].as_u64().unwrap());
+        frames.app.ui.frame_all = true;
+        frames.run(Vec::new(), Modifiers::NONE);
+        let original = frames.app.session.pkg.clone();
+        let history = frames.app.session.history();
+        let position = frames.center(node);
+
+        frames.time += 1.0;
+        frames.run(vec![Event::PointerMoved(position)], Modifiers::NONE);
+        for pressed in [true, false, true, false] {
+            frames.run(vec![Event::PointerButton { pos: position, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE }], Modifiers::NONE);
+        }
+
+        assert!(frames.app.function_editor.is_none(), "{definition} double-click opened a function");
+        assert!(frames.app.pattern_editor.is_none(), "{definition} double-click opened a pattern");
+        assert_eq!(frames.app.session.selection, vec![node]);
+        assert_eq!(frames.app.session.view2d.node, Some(node));
+
+        let control = Modifiers::CTRL | Modifiers::COMMAND;
+        for pressed in [true, false] {
+            frames.run(vec![Event::Key { key: egui::Key::E, physical_key: Some(egui::Key::E), pressed, repeat: false, modifiers: control }], control);
+        }
+
+        if definition == "fx_map" {
+            assert_eq!(frames.app.pattern_editor.as_ref().map(|editor| editor.node), Some(node));
+            assert!(frames.app.function_editor.is_none());
+        } else {
+            assert_eq!(frames.app.function_editor.as_ref().and_then(|editor| editor.node), Some(node));
+            assert!(frames.app.pattern_editor.is_none());
+        }
+        assert_eq!(frames.app.session.pkg, original);
+        assert_eq!(frames.app.session.history(), history);
+    }
+}
+
+#[test]
 fn selected_pattern_subgraph_opens_with_control_e() {
     let mut frames = Frames::new(new_session());
     let node = NodeId(frames.app.run("graph.node.add", json!({"def": "fx_map"})).unwrap()["id"].as_u64().unwrap());
@@ -316,16 +355,16 @@ fn pin_labels_follow_node_hover_while_pins_stay_visible() {
     let multiply = function.add("mul", &[], None);
     frames.app.run("graph.function.set", json!({"function": function}));
     frames.run(vec![Event::PointerGone], Modifiers::NONE);
-    let labels = ["A", "Output"];
+    let labels = ["A", "B", "Output"];
     assert!(labels.iter().all(|label| !frames.canvas_text.iter().any(|text| text == label)), "{:?}", frames.canvas_text);
-    assert_eq!(frames.app.graph.ports.len(), 2);
+    assert_eq!(frames.app.graph.ports.len(), 3);
 
     let position = frames.center(NodeId(u64::from(multiply)));
     frames.run(vec![Event::PointerMoved(position)], Modifiers::NONE);
     assert!(labels.iter().all(|label| frames.canvas_text.iter().any(|text| text == label)), "{:?}", frames.canvas_text);
     frames.run(vec![Event::PointerGone], Modifiers::NONE);
     assert!(labels.iter().all(|label| !frames.canvas_text.iter().any(|text| text == label)), "{:?}", frames.canvas_text);
-    assert_eq!(frames.app.graph.ports.len(), 2);
+    assert_eq!(frames.app.graph.ports.len(), 3);
 }
 
 #[test]
@@ -355,7 +394,7 @@ fn function_dots_wire_move_and_save_with_regular_card_geometry() {
     assert_eq!(dot_ports.len(), 2);
     assert!((dot_ports[0].pos.y - dot_ports[1].pos.y).abs() < 0.01);
     assert!(dot_ports[0].pos.x < dot_ports[1].pos.x);
-    assert!(!frames.app.graph.ports.iter().any(|port| port.node.0 == u64::from(multiply) && port.port == "1"));
+    assert!(frames.app.graph.ports.iter().any(|port| port.node.0 == u64::from(multiply) && port.port == "1"));
 
     for (from, to, input) in [(source, dot, "0"), (dot, multiply, "0"), (dot, multiply, "1")] {
         let start = frames.app.graph.ports.iter().find(|port| port.node.0 == u64::from(from) && port.output).unwrap().pos;
@@ -386,7 +425,7 @@ fn function_dots_wire_move_and_save_with_regular_card_geometry() {
 }
 
 #[test]
-fn regular_inputs_expand_on_connection_and_keep_saved_later_connections_visible() {
+fn fixed_material_inputs_remain_visible_and_stationary_when_connected() {
     let mut frames = Frames::new(new_session());
     let source = frames.app.run("graph.node.add", json!({"def": "uniform", "at": [0, 0]})).unwrap()["id"].as_u64().unwrap();
     let target = frames.app.run("graph.node.add", json!({"def": "blend", "at": [320, 0]})).unwrap()["id"].as_u64().unwrap();
@@ -395,10 +434,12 @@ fn regular_inputs_expand_on_connection_and_keep_saved_later_connections_visible(
     let visible =
         |frames: &Frames| frames.app.graph.ports.iter().filter(|port| port.node.0 == target && !port.output).map(|port| port.port.clone()).collect::<Vec<_>>();
     let inputs = frames.app.session.input_ports(NodeId(target));
-    assert_eq!(visible(&frames), inputs[..1]);
+    let positions: Vec<_> = frames.app.graph.ports.iter().filter(|port| port.node.0 == target).map(|port| port.pos).collect();
+    assert_eq!(visible(&frames), inputs);
     for input in &inputs {
         frames.app.run("graph.connect", json!({"from": source, "to": target, "toPort": input})).unwrap();
         frames.run(Vec::new(), Modifiers::NONE);
+        assert_eq!(frames.app.graph.ports.iter().filter(|port| port.node.0 == target).map(|port| port.pos).collect::<Vec<_>>(), positions);
     }
     assert_eq!(visible(&frames), inputs);
     frames.app.run("graph.disconnect", json!({"to": target, "toPort": inputs[0]})).unwrap();
@@ -408,7 +449,44 @@ fn regular_inputs_expand_on_connection_and_keep_saved_later_connections_visible(
         frames.app.run("graph.disconnect", json!({"to": target, "toPort": input})).unwrap();
     }
     frames.run(Vec::new(), Modifiers::NONE);
-    assert_eq!(visible(&frames), inputs[..1]);
+    assert_eq!(visible(&frames), inputs);
+}
+
+#[test]
+fn processor_image_inputs_reveal_the_next_slot_and_keep_later_connections_visible() {
+    for definition in ["pixel_processor", "value_processor", "fx_map"] {
+        let mut frames = Frames::new(new_session());
+        let source = frames.app.run("graph.node.add", json!({"def": "uniform", "at": [0, 0]})).unwrap()["id"].as_u64().unwrap();
+        let target = frames.app.run("graph.node.add", json!({"def": definition, "at": [320, 0]})).unwrap()["id"].as_u64().unwrap();
+        frames.app.ui.frame_all = true;
+        frames.run(Vec::new(), Modifiers::NONE);
+        let prefix = materialcraft_engine::nodes::image_input_prefix(definition).unwrap();
+        let visible = |frames: &Frames| {
+            frames
+                .app
+                .graph
+                .ports
+                .iter()
+                .filter(|port| port.node.0 == target && !port.output && port.port.starts_with(prefix))
+                .map(|port| port.port.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(visible(&frames), [format!("{prefix}0")], "{definition}");
+        frames.app.run("graph.connect", json!({"from": source, "to": target, "toPort": format!("{prefix}0")})).unwrap();
+        frames.run(Vec::new(), Modifiers::NONE);
+        assert_eq!(visible(&frames), [format!("{prefix}0"), format!("{prefix}1")], "{definition}");
+        for slot in 1..=3 {
+            frames.app.run("graph.connect", json!({"from": source, "to": target, "toPort": format!("{prefix}{slot}")})).unwrap();
+        }
+        for slot in 0..3 {
+            frames.app.run("graph.disconnect", json!({"to": target, "toPort": format!("{prefix}{slot}")})).unwrap();
+        }
+        frames.run(Vec::new(), Modifiers::NONE);
+        assert_eq!(visible(&frames), (0..=4).map(|slot| format!("{prefix}{slot}")).collect::<Vec<_>>(), "{definition}");
+        frames.app.run("graph.disconnect", json!({"to": target, "toPort": format!("{prefix}3")})).unwrap();
+        frames.run(Vec::new(), Modifiers::NONE);
+        assert_eq!(visible(&frames), [format!("{prefix}0")], "{definition}");
+    }
 }
 
 #[test]
@@ -426,7 +504,7 @@ fn every_canvas_keeps_properties_after_deselection() {
                 graph.nodes[1].pos = [256.0, 0.0];
                 graph.output = Some(id);
                 frames.app.run("graph.function.set", json!({"function": graph})).unwrap();
-                (NodeId(u64::from(id)), "Multiply - Properties")
+                (NodeId(u64::from(id)), "Multiplication - Properties")
             }
             "pattern" => {
                 let owner = NodeId(frames.app.run("graph.node.add", json!({"def": "fx_map"})).unwrap()["id"].as_u64().unwrap());
@@ -439,7 +517,7 @@ fn every_canvas_keeps_properties_after_deselection() {
             }
             _ => {
                 let id = NodeId(frames.app.run("graph.node.add", json!({"def": "uniform"})).unwrap()["id"].as_u64().unwrap());
-                (id, "Uniform Color - Properties")
+                (id, "Uniform color - Properties")
             }
         };
         frames.app.ui.frame_all = true;
@@ -528,5 +606,191 @@ fn box_selection_and_alt_panning_are_shared_by_every_canvas() {
         let after = frames.app.graph.rects[0].1.center();
         assert!((after - before - (to - from)).length() < 0.01, "{kind} pan: {before:?} -> {after:?}");
         assert_eq!(frames.app.session.pkg, original, "{kind} navigation edited the document");
+    }
+}
+
+#[test]
+fn dots_move_from_their_body_and_still_wire_from_just_outside_at_any_zoom() {
+    let mut frames = Frames::new(new_session());
+    let ids: Vec<NodeId> = [[0, 0], [256, 0]]
+        .into_iter()
+        .map(|at| NodeId(frames.app.run("graph.node.add", json!({"def": "dot", "at": at})).unwrap()["id"].as_u64().unwrap()))
+        .collect();
+    frames.app.ui.frame_all = true;
+    frames.run(Vec::new(), Modifiers::NONE);
+
+    // Zoomed in, at 100% and zoomed out: the dot's ports used to cover its whole body
+    for zoom in [2.0, 1.0, 0.5, 0.25] {
+        frames.app.ui.graph_camera.zoom = zoom;
+        frames.run(Vec::new(), Modifiers::NONE);
+        let before = frames.app.session.graph().unwrap().node(ids[0]).unwrap().pos;
+        let from = frames.center(ids[0]);
+        drag(&mut frames, from, from + vec2(40.0, 30.0));
+        let graph = frames.app.session.graph().unwrap();
+        assert_ne!(graph.node(ids[0]).unwrap().pos, before, "the dot did not move at zoom {zoom}");
+        assert!(graph.connections.is_empty(), "pressing the dot started a wire at zoom {zoom}");
+    }
+
+    frames.app.ui.graph_camera.zoom = 1.0;
+    frames.run(Vec::new(), Modifiers::NONE);
+    let output = frames.app.graph.ports.iter().find(|port| port.node == ids[0] && port.output).unwrap().pos;
+    let input = frames.app.graph.ports.iter().find(|port| port.node == ids[1] && !port.output).unwrap().pos;
+    drag(&mut frames, output + vec2(6.0, 0.0), input);
+    let graph = frames.app.session.graph().unwrap();
+    assert_eq!(graph.connections.len(), 1);
+    assert_eq!((graph.connections[0].from, graph.connections[0].to), (ids[0], ids[1]));
+}
+
+#[test]
+fn pattern_links_use_the_shared_pair_shortcut_and_preserve_node_selection() {
+    use materialcraft_engine::core::{PatternGraph, PatternNodeKind, Value};
+
+    let mut session = new_session();
+    let owner = NodeId(materialcraft_engine::execute(&mut session, "graph.node.add", &json!({"def": "fx_map"})).unwrap()["id"].as_u64().unwrap());
+    let mut graph = PatternGraph::with_root(PatternNodeKind::Switch);
+    let first = graph.add(PatternNodeKind::Quadrant).unwrap();
+    let second = graph.add(PatternNodeKind::Quadrant).unwrap();
+    graph.nodes[0].children = vec![Some(first), Some(second)];
+    for (node, position) in graph.nodes.iter_mut().zip([[0.0, 0.0], [-200.0, 300.0], [200.0, 300.0]]) {
+        node.position = position;
+    }
+    materialcraft_engine::execute(&mut session, "graph.pattern.set", &json!({"id": owner.0, "pattern": graph})).unwrap();
+    let original = session.pkg.clone();
+    let mut frames = Frames::new(session);
+    frames.app.pattern_editor = Some(crate::pattern::PatternEditor::new(frames.app.session.graph, owner));
+    frames.run(Vec::new(), Modifiers::NONE);
+    for (port, modifiers) in [("output0", Modifiers::NONE), ("output1", Modifiers::SHIFT)] {
+        let curve = frames.app.graph.wires.iter().find(|(wire, _)| wire.0 == NodeId(1) && wire.1 == port).unwrap().1;
+        frames.click(super::wire_geometry::bezier_at(&curve, 0.5), modifiers);
+    }
+    frames.click(frames.center(NodeId(1)), Modifiers::SHIFT);
+    assert_eq!(frames.app.pattern_editor.as_ref().unwrap().selected_wires.len(), 2);
+    assert_eq!(frames.app.pattern_editor.as_ref().unwrap().selection, vec![1]);
+    let key = |key| Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
+    frames.run(vec![key(egui::Key::X)], Modifiers::NONE);
+    let Value::PatternGraph(swapped) = &frames.app.session.graph().unwrap().node(owner).unwrap().params["pattern"] else { panic!() };
+    assert_eq!(swapped.nodes[0].children, vec![Some(second), Some(first)]);
+    assert_eq!(frames.app.pattern_editor.as_ref().unwrap().selection, vec![1]);
+    frames.run(vec![key(egui::Key::X)], Modifiers::NONE);
+    assert_eq!(frames.app.session.pkg, original);
+    frames.run(vec![key(egui::Key::Delete)], Modifiers::NONE);
+    let Value::PatternGraph(deleted) = &frames.app.session.graph().unwrap().node(owner).unwrap().params["pattern"] else { panic!() };
+    assert_eq!(deleted.nodes[0].children, vec![None, None]);
+    frames.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(frames.app.session.pkg, original);
+}
+
+#[test]
+fn fixed_function_inputs_remain_visible_and_stationary_when_connected() {
+    use materialcraft_engine::{FunctionGraphTarget, core::FunctionGraph};
+
+    for definition in ["function", "pixel_processor", "value_processor"] {
+        let mut session = new_session();
+        let (target, owner) = if definition == "function" {
+            materialcraft_engine::execute(&mut session, "file.new", &json!({"kind": "function"})).unwrap();
+            (FunctionGraphTarget::Graph, None)
+        } else {
+            let id = materialcraft_engine::execute(&mut session, "graph.node.add", &json!({"def": definition})).unwrap()["id"].as_u64().unwrap();
+            (FunctionGraphTarget::Parameter { node: NodeId(id), parameter: "function".into() }, Some(NodeId(id)))
+        };
+        let mut graph = FunctionGraph::default();
+        let source = graph.add_constant(materialcraft_engine::core::Value::Float(0.5));
+        let greater = graph.add("gt", &[], None);
+        let interpolation = graph.add("lerp", &[], None);
+        for (node, position) in graph.nodes.iter_mut().zip([[0.0, 100.0], [350.0, 0.0], [350.0, 220.0]]) {
+            node.pos = position;
+        }
+        materialcraft_engine::execute(&mut session, "graph.function.set", &json!({"target": target, "function": graph})).unwrap();
+        let mut frames = Frames::new(session);
+        if let Some(owner) = owner {
+            super::subgraph_navigation::open_function(&mut frames.app, owner, crate::function::FunctionTarget::Parameter("function".into()));
+            frames.run(Vec::new(), Modifiers::NONE);
+        }
+        let inputs = |frames: &Frames, id: u32| {
+            frames
+                .app
+                .graph
+                .ports
+                .iter()
+                .filter(|port| port.node == NodeId(u64::from(id)) && !port.output)
+                .map(|port| (port.label.clone(), port.pos))
+                .collect::<Vec<_>>()
+        };
+        let greater_ports = inputs(&frames, greater);
+        let interpolation_ports = inputs(&frames, interpolation);
+        assert_eq!(greater_ports.iter().map(|(label, _)| label.as_str()).collect::<Vec<_>>(), ["A", "B"], "{definition}");
+        assert_eq!(interpolation_ports.iter().map(|(label, _)| label.as_str()).collect::<Vec<_>>(), ["A", "B", "Factor"], "{definition}");
+        for (id, slot) in [(greater, 1), (interpolation, 2)] {
+            let from = frames.app.graph.ports.iter().find(|port| port.node == NodeId(u64::from(source)) && port.output).unwrap().pos;
+            let to = inputs(&frames, id)[slot].1;
+            drag(&mut frames, from, to);
+            assert_eq!(target.current(&frames.app.session).unwrap().node(id).unwrap().inputs[slot], Some(source));
+            assert_eq!(inputs(&frames, greater), greater_ports);
+            assert_eq!(inputs(&frames, interpolation), interpolation_ports);
+        }
+        frames.app.run("edit.undo", json!({})).unwrap();
+        frames.run(Vec::new(), Modifiers::NONE);
+        assert_eq!(inputs(&frames, interpolation), interpolation_ports);
+    }
+}
+
+#[test]
+fn function_links_swap_and_delete_without_editing_the_parent_graph() {
+    use materialcraft_engine::{FunctionGraphTarget, core::FunctionGraph};
+
+    for definition in ["function", "pixel_processor", "value_processor"] {
+        let mut session = materialcraft_engine::new_session();
+        let (target, owner) = if definition == "function" {
+            materialcraft_engine::execute(&mut session, "file.new", &json!({"kind": "function"})).unwrap();
+            (FunctionGraphTarget::Graph, None)
+        } else {
+            let id = materialcraft_engine::execute(&mut session, "graph.node.add", &json!({"def": definition})).unwrap()["id"].as_u64().unwrap();
+            (FunctionGraphTarget::Parameter { node: NodeId(id), parameter: "function".into() }, Some(NodeId(id)))
+        };
+        let mut graph = FunctionGraph::default();
+        let a = graph.add_constant(materialcraft_engine::core::Value::Float(1.0));
+        let b = graph.add_constant(materialcraft_engine::core::Value::Float(2.0));
+        let subtract = graph.add("sub", &[a, b], None);
+        graph.output = Some(subtract);
+        for (node, position) in graph.nodes.iter_mut().zip([[0.0, -150.0], [0.0, 150.0], [450.0, 0.0]]) {
+            node.pos = position;
+        }
+        materialcraft_engine::execute(&mut session, "graph.function.set", &json!({"target": target, "function": graph})).unwrap();
+        let mut frames = Frames::new(session);
+        if let Some(owner) = owner {
+            super::subgraph_navigation::open_function(&mut frames.app, owner, crate::function::FunctionTarget::Parameter("function".into()));
+            frames.run(Vec::new(), egui::Modifiers::NONE);
+        }
+        let original = frames.app.session.pkg.clone();
+        frames.app.session.reset_history();
+        for (input, modifiers) in [("0", egui::Modifiers::NONE), ("1", egui::Modifiers::SHIFT)] {
+            let curve = frames.app.graph.wires.iter().find(|(wire, _)| wire.0 == NodeId(u64::from(subtract)) && wire.1 == input).unwrap().1;
+            frames.click(super::wire_geometry::bezier_at(&curve, 0.5), modifiers);
+        }
+        let header = frames.app.graph.rects.iter().find(|(id, _)| *id == NodeId(u64::from(a))).unwrap().1.min + vec2(12.0, 12.0);
+        frames.click(header, egui::Modifiers::SHIFT);
+        assert_eq!(frames.app.function_editor.as_ref().unwrap().selection, vec![a]);
+        let key = |key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        frames.run(vec![key(egui::Key::X)], egui::Modifiers::NONE);
+        assert_eq!(target.current(&frames.app.session).unwrap().node(subtract).unwrap().inputs, vec![Some(b), Some(a)], "{definition}");
+        assert_eq!(frames.app.function_editor.as_ref().unwrap().selection, vec![a]);
+        assert_eq!(frames.app.session.history().len(), 1);
+        frames.run(vec![key(egui::Key::X)], egui::Modifiers::NONE);
+        assert_eq!(frames.app.session.pkg, original);
+        frames.run(vec![key(egui::Key::Delete)], egui::Modifiers::NONE);
+        assert_eq!(target.current(&frames.app.session).unwrap().node(subtract).unwrap().inputs, vec![None, None]);
+        frames.app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(frames.app.session.pkg, original);
+
+        frames.app.run("graph.function.edit", json!({"target": target, "edit": {"action": "connect", "from": a, "to": subtract, "input": 1}})).unwrap();
+        frames.app.function_editor.as_mut().unwrap().selected_wires =
+            vec![(NodeId(u64::from(subtract)), "0".into()), (NodeId(u64::from(subtract)), "1".into())];
+        let package = frames.app.session.pkg.clone();
+        let history = frames.app.session.history();
+        assert!(!menus::enabled(&frames.app, "graph.wire.swap"));
+        frames.run(vec![key(egui::Key::X)], egui::Modifiers::NONE);
+        menus::invoke(&mut frames.app, &frames.ctx, "graph.wire.swap");
+        assert_eq!(frames.app.session.pkg, package);
+        assert_eq!(frames.app.session.history(), history);
     }
 }

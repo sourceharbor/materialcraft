@@ -131,9 +131,40 @@ fn clicked_wires_swap_with_x_and_delete_together() {
     // Still selected: X again swaps back
     frame(&mut app, vec![key(egui::Key::X)], egui::Modifiers::NONE);
     assert_eq!((src(&app, "foreground"), src(&app, "background")), (a, b));
+
+    app.run("graph.connect", json!({"from": a, "to": blend, "toPort": "background"})).unwrap();
+    let package = app.session.pkg.clone();
+    let history = app.session.history();
+    assert!(!crate::menus::enabled(&app, "graph.wire.swap"));
+    frame(&mut app, vec![key(egui::Key::X)], egui::Modifiers::NONE);
+    crate::menus::invoke(&mut app, &ctx, "graph.wire.swap");
+    assert_eq!(app.session.pkg, package);
+    assert_eq!(app.session.history(), history);
+
     frame(&mut app, vec![key(egui::Key::Delete)], egui::Modifiers::NONE);
     assert!(app.session.graph().unwrap().connections.is_empty());
     assert!(app.graph.selected_wires.is_empty());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn node_search_shortcuts_wait_for_the_update_prompt() {
+    for key in [egui::Key::Space, egui::Key::Tab] {
+        let ctx = egui::Context::default();
+        let mut app = MaterialCraftApp::headless(materialcraft_engine::sample_session(), crate::UiState::default());
+        crate::updates_ui::open_prompt_for_test(&mut app);
+        let mut draw = |ui: &mut Ui| show(&mut app, ui);
+        ctx.run_ui(egui::RawInput::default(), &mut draw).textures_delta.clear();
+        let input = egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(pos2(200.0, 200.0)),
+                egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
+            ],
+            ..Default::default()
+        };
+        ctx.run_ui(input, &mut draw).textures_delta.clear();
+        assert!(app.graph.search.is_none(), "{key:?}");
+    }
 }
 
 #[test]

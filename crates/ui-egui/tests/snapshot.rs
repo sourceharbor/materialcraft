@@ -1,3 +1,18 @@
+#[path = "snapshot/explorer.rs"]
+mod explorer;
+
+#[path = "snapshot/function_instances.rs"]
+mod function_instances;
+
+#[path = "snapshot/function_library.rs"]
+mod function_library;
+
+#[path = "snapshot/function_variables.rs"]
+mod function_variables;
+
+#[path = "snapshot/embedded_graphs.rs"]
+mod embedded_graphs;
+
 use std::time::Duration;
 
 use egui::vec2;
@@ -32,9 +47,598 @@ fn save(h: &mut Harness<'static, MaterialCraftApp>, dir: &std::path::Path, name:
     println!("wrote {}", dir.join(format!("{name}.png")).display());
 }
 
+fn assert_node_menu_order(harness: &Harness<'static, MaterialCraftApp>, labels: &[&str]) {
+    let button = |label| By::new().role(egui::accesskit::Role::Button).label(label);
+    // Canvas cards share these labels; compare the buttons within the submenu's own parent
+    let menu = harness
+        .get_all(button(labels[0]))
+        .filter_map(|node| node.parent())
+        .find(|parent| {
+            let actual: Vec<_> = parent.query_all(By::new().role(egui::accesskit::Role::Button)).filter_map(|node| node.accesskit_node().label()).collect();
+            actual.len() == labels.len() && labels.iter().all(|label| actual.iter().any(|actual| actual == label))
+        })
+        .expect("the submenu must contain every available native operation exactly once");
+    let actual: Vec<_> = menu.query_all(By::new().role(egui::accesskit::Role::Button)).filter_map(|node| node.accesskit_node().label()).collect();
+
+    assert_eq!(actual, labels, "native node menu order must match the catalog");
+}
+
+fn double_click(harness: &mut Harness<'static, MaterialCraftApp>, position: egui::Pos2) {
+    harness.event(egui::Event::PointerMoved(position));
+    harness.step();
+    let start = harness.ctx.input(|input| input.time) + 1.0;
+    for (index, pressed) in [true, false, true, false].into_iter().enumerate() {
+        harness.input_mut().time = Some(start + index as f64 * 0.05);
+        harness.event(egui::Event::PointerButton { pos: position, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+        harness.step();
+    }
+    settle(harness, 3);
+}
+
 #[test]
 #[ignore = "requires an offscreen GPU; run explicitly with --ignored"]
-fn explorer_export_opens_the_clicked_graph() {
+fn explorer_drags_a_linked_graph_between_open_packages() {
+    use materialcraft_engine::{
+        Session,
+        core::{Graph, Package, Value},
+        file_cmds, formats,
+    };
+    let directory = std::path::PathBuf::from(std::env::var_os("MC_SNAPSHOT_DIR").expect("set MC_SNAPSHOT_DIR"));
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut source = Package::new("Source file");
+    let mut graph = Graph::new("Reusable tint");
+    graph.size = [4, 4];
+    let color = graph.add_node("uniform", [0.0; 2]);
+    graph.node_mut(color).unwrap().params.insert("color".into(), Value::Color([0.2, 0.6, 0.8, 1.0]));
+    let output = graph.add_node("output", [256.0, 0.0]);
+    graph.connect(color, "output", output, "input").unwrap();
+    source.graphs.push(graph);
+    let mut session = Session::new(source);
+    session.path = Some(directory.join("source.sbs").to_string_lossy().into_owned());
+    let mut target = Package::new("Target file");
+    target.graphs.push(Graph::new("Target canvas"));
+    file_cmds::open_bytes(&mut session, &formats::sbs::write_sbs(&target).unwrap(), Some(directory.join("target.sbs").to_string_lossy().into_owned())).unwrap();
+    session.preview_size = Some(16);
+    let target_document = session.document_id;
+    let mut app = MaterialCraftApp::headless(session, UiState::default());
+    app.ui.dock.close(materialcraft_ui_egui::docking::Panel::Library);
+    let mut harness = harness(app, 1600.0, 960.0);
+    settle(&mut harness, 6);
+    let start = harness.get(By::new().role(egui::accesskit::Role::TreeItem).label("Reusable tint")).rect().center();
+    let end = harness.state().graph.view.center();
+    harness.event(egui::Event::PointerMoved(start));
+    harness.step();
+    harness.event(egui::Event::PointerButton { pos: start, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+    harness.step();
+    for position in [start + vec2(12.0, 0.0), end] {
+        harness.event(egui::Event::PointerMoved(position));
+        harness.step();
+    }
+    harness.event(egui::Event::PointerButton { pos: end, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+    settle(&mut harness, 8);
+    assert_eq!(harness.state().session.document_id, target_document);
+    assert_eq!(harness.state().session.graph().unwrap().nodes.len(), 1);
+    let instance = harness.state().session.graph().unwrap().nodes[0].id;
+    assert_eq!(harness.state().session.graph().unwrap().node(instance).unwrap().instance.as_ref().unwrap().graph, "Reusable tint");
+    assert!(harness.state().session.cooked.nodes[&instance].error.is_none());
+    save(&mut harness, &directory, "linked-instance-explorer-drop");
+    let position = harness.get(By::new().role(egui::accesskit::Role::TreeItem).label("Reusable tint")).rect().center();
+    double_click(&mut harness, position);
+    assert_eq!(harness.state().session.document_id, 0);
+    harness.state_mut().run("graph.select", json!({"ids": [color.0]})).unwrap();
+    harness.state_mut().run("graph.node.param", json!({"id": color.0, "param": "color", "value": [0.9, 0.3, 0.1, 1.0]})).unwrap();
+    let position = harness.get(By::new().role(egui::accesskit::Role::TreeItem).label("Target canvas")).rect().center();
+    double_click(&mut harness, position);
+    settle(&mut harness, 8);
+    assert_eq!(harness.state().session.document_id, target_document);
+    assert_eq!(harness.state().session.history(), ["Add graph instance"]);
+    let value = harness.state().session.cooked.image(instance, 0).unwrap().get(0, 0, false);
+    assert!(value.into_iter().zip([0.9, 0.3, 0.1, 1.0]).all(|(actual, expected)| (actual - expected).abs() < 1e-6));
+    assert!(harness.state().session.modified);
+    save(&mut harness, &directory, "linked-instance-source-edit");
+    let position = harness.get(By::new().role(egui::accesskit::Role::Button).label("Reusable tint")).rect().center();
+    double_click(&mut harness, position);
+    assert_eq!(harness.state().session.document_id, target_document, "double-click must not open the instance source");
+    assert_eq!(harness.state().session.graph().unwrap().name, "Target canvas");
+    assert_eq!(harness.state().session.history(), ["Add graph instance"]);
+    harness.key_press_modifiers(egui::Modifiers::CTRL | egui::Modifiers::COMMAND, egui::Key::E);
+    settle(&mut harness, 3);
+    assert_eq!(harness.state().session.document_id, target_document, "Ctrl+E must not open the instance source");
+    assert_eq!(harness.state().session.graph().unwrap().name, "Target canvas");
+    assert_eq!(harness.state().session.history(), ["Add graph instance"]);
+    harness.get(By::new().role(egui::accesskit::Role::Button).label("Reusable tint")).click_secondary();
+    settle(&mut harness, 2);
+    for label in ["View output in 2D view", "Copy info to clipboard", "Open reference", "Create graph from selection (1)", "Duplicate selection Ctrl+D"] {
+        assert!(harness.query(By::new().label(label)).is_some(), "missing instance action: {label}");
+    }
+    save(&mut harness, &directory, "linked-instance-context-menu");
+    harness.get(By::new().label("Open reference")).click();
+    settle(&mut harness, 4);
+    assert_eq!(harness.state().session.document_id, 0);
+    assert_eq!(harness.state().session.graph().unwrap().name, "Reusable tint");
+}
+
+#[test]
+#[ignore = "requires an offscreen GPU; run explicitly with --ignored"]
+fn function_output_highlight_follows_context_menu_and_undo() {
+    use materialcraft_engine::core::{FunctionGraph, Value};
+
+    let mut app = MaterialCraftApp::headless(materialcraft_engine::new_session(), UiState::default());
+    app.ui.dock.close(materialcraft_ui_egui::docking::Panel::Library);
+    app.run("file.new", json!({"kind": "function", "name": "Output selection"})).unwrap();
+    let mut function = FunctionGraph::default();
+    let input = function.add_constant(Value::Float(0.5));
+    let add = function.add("add", &[input, input], None);
+    let multiply = function.add("mul", &[input, input], None);
+    let dot = function.add("passthrough", &[multiply], None);
+    for (node, position) in function.nodes.iter_mut().zip([[0.0, 64.0], [256.0, 0.0], [256.0, 224.0], [480.0, 272.0]]) {
+        node.pos = position;
+    }
+    function.output = Some(add);
+    app.run("graph.function.set", json!({"function": function})).unwrap();
+    app.session.reset_history();
+
+    let mut harness = harness(app, 1600.0, 960.0);
+    settle(&mut harness, 6);
+    let directory = std::path::PathBuf::from(std::env::var_os("MC_SNAPSHOT_DIR").expect("set MC_SNAPSHOT_DIR"));
+    std::fs::create_dir_all(&directory).unwrap();
+    let query = |label| By::new().role(egui::accesskit::Role::Button).label(label);
+    let assert_highlight = |harness: &mut Harness<'static, MaterialCraftApp>, label, output| {
+        let bounds = harness.get(query(label)).rect();
+        let sample = if label == "Dot" { bounds.center() } else { bounds.min + bounds.size() * egui::vec2(0.2, 0.4) };
+        let image = harness.render().unwrap();
+        let pixel = image.get_pixel(sample.x as u32, sample.y as u32).0;
+        assert_eq!(pixel == [255, 163, 26, 255], output, "{label}: {pixel:?}");
+    };
+
+    harness.get(query("Multiplication")).click_secondary();
+    settle(&mut harness, 3);
+    let labels = [
+        "Add Comment",
+        "Add Frame",
+        "Copy info to clipboard",
+        "Set as output node",
+        "Create graph from selection (1)",
+        "Copy selection Ctrl+C",
+        "Delete selection Delete",
+        "Delete and relink Backspace",
+        "Duplicate selection Ctrl+D",
+        "Duplicate selection without link Ctrl+Shift+D",
+        "Select upstream nodes",
+        "Select downstream nodes",
+        "Disable selection Shift+D",
+    ];
+    let rows: Vec<_> = labels.iter().map(|label| harness.get(query(label)).rect().center().y).collect();
+    assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
+    let menu_column = harness.get(query("Copy info to clipboard")).rect();
+    for label in ["Add node", "Add Dot node", "Add Navigation pin", "Save package", "Paste", "Cut selection", "Select all", "Previous pin", "Next pin"] {
+        assert!(
+            harness.query_all(By::new().role(egui::accesskit::Role::Button).label_contains(label)).all(|button| {
+                let center = button.rect().center();
+                center.x < menu_column.left() || center.x > menu_column.right() || center.y < rows[0] || center.y > *rows.last().unwrap()
+            }),
+            "unexpected node action {label}"
+        );
+    }
+    save(&mut harness, &directory, "function-output-context-menu");
+    assert_highlight(&mut harness, "Add", true);
+    harness.get(By::new().role(egui::accesskit::Role::Button).label_contains("Set as output node")).click();
+    settle(&mut harness, 3);
+    assert_eq!(harness.state().session.graph().unwrap().function.as_ref().unwrap().output, Some(multiply));
+    assert_eq!(harness.state().session.history().len(), 1);
+
+    harness.get(query("Add")).click();
+    settle(&mut harness, 3);
+    assert_highlight(&mut harness, "Add", false);
+    assert_highlight(&mut harness, "Multiplication", true);
+    save(&mut harness, &directory, "function-output-separate-selection");
+
+    harness.state_mut().run("edit.undo", json!({})).unwrap();
+    settle(&mut harness, 3);
+    assert_eq!(harness.state().session.graph().unwrap().function.as_ref().unwrap().output, Some(add));
+    assert_highlight(&mut harness, "Add", true);
+    assert_highlight(&mut harness, "Multiplication", false);
+    harness.state_mut().run("edit.redo", json!({})).unwrap();
+    settle(&mut harness, 3);
+    assert_highlight(&mut harness, "Multiplication", true);
+
+    harness.get(query("Dot")).click_secondary();
+    settle(&mut harness, 3);
+    assert!(harness.query(query("Set as output node")).is_none());
+    assert_eq!(harness.state().session.graph().unwrap().function.as_ref().unwrap().output, Some(multiply));
+    assert_highlight(&mut harness, "Dot", false);
+    assert_highlight(&mut harness, "Multiplication", true);
+    save(&mut harness, &directory, "function-dot-context-menu");
+    let history = harness.state().session.history();
+    harness.get(query("Copy info to clipboard")).click();
+    let mut copied = None;
+    for _ in 0..3 {
+        harness.step();
+        for command in &harness.output().platform_output.commands {
+            if let egui::OutputCommand::CopyText(text) = command {
+                copied = Some(serde_json::from_str::<serde_json::Value>(text).unwrap());
+            }
+        }
+    }
+    assert_eq!(copied.unwrap()["node"]["id"], dot);
+    assert_eq!(harness.state().session.history(), history);
+
+    harness.state_mut().run("graph.select", json!({"ids": [add, multiply]})).unwrap();
+    settle(&mut harness, 2);
+    harness.get(query("Multiplication")).click_secondary();
+    settle(&mut harness, 3);
+    assert!(harness.get(query("Set as output node")).accesskit_node().is_disabled());
+    harness.get(query("Create graph from selection (2)"));
+    assert!(harness.query(query("Swap links X")).is_none());
+    save(&mut harness, &directory, "function-multiple-node-context-menu");
+    harness.key_press(egui::Key::Escape);
+    settle(&mut harness, 2);
+
+    harness.state_mut().run("edit.selectNone", json!({})).unwrap();
+    settle(&mut harness, 2);
+    let background = harness.get(By::new().role(egui::accesskit::Role::Canvas).label("Function Graph")).rect().min + vec2(24.0, 24.0);
+    harness.event(egui::Event::PointerMoved(background));
+    harness.event(egui::Event::PointerButton { pos: background, button: egui::PointerButton::Secondary, pressed: true, modifiers: egui::Modifiers::NONE });
+    harness.step();
+    harness.event(egui::Event::PointerButton { pos: background, button: egui::PointerButton::Secondary, pressed: false, modifiers: egui::Modifiers::NONE });
+    settle(&mut harness, 3);
+    let labels = [
+        "Add node",
+        "Add Comment",
+        "Add Frame",
+        "Add Navigation pin",
+        "Add Dot node",
+        "Save package Ctrl+S",
+        "Paste Ctrl+V",
+        "Paste without link Ctrl+Shift+V",
+        "Select all Ctrl+A",
+        "Previous pin Shift+F2",
+        "Next pin F2",
+        "Copy selection Ctrl+C",
+        "Delete selection Delete",
+        "Delete and relink Backspace",
+        "Duplicate selection Ctrl+D",
+        "Duplicate selection without link Ctrl+Shift+D",
+        "Select upstream nodes",
+        "Select downstream nodes",
+        "Disable selection Shift+D",
+    ];
+    let rows: Vec<_> = labels.iter().map(|label| harness.get(query(label)).rect().center().y).collect();
+    assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
+    for label in &labels[11..] {
+        assert!(harness.get(query(label)).accesskit_node().is_disabled(), "{label}");
+    }
+    for label in ["Copy info to clipboard", "Set as output node", "Cut selection"] {
+        assert!(harness.query(query(label)).is_none());
+    }
+    save(&mut harness, &directory, "function-background-context-menu");
+}
+
+#[test]
+#[ignore = "requires an offscreen GPU; run explicitly with --ignored"]
+fn selected_function_links_expose_swap_in_the_context_menu() {
+    use materialcraft_engine::core::{FunctionGraph, NodeId, Value};
+
+    let mut app = MaterialCraftApp::headless(materialcraft_engine::new_session(), UiState::default());
+    app.ui.dock.close(materialcraft_ui_egui::docking::Panel::Library);
+    app.run("file.new", json!({"kind": "function", "name": "Swap links"})).unwrap();
+    let mut graph = FunctionGraph::default();
+    let a = graph.add_constant(Value::Float(1.0));
+    let b = graph.add_constant(Value::Float(2.0));
+    let subtract = graph.add("sub", &[a, b], None);
+    let interpolation = graph.add("lerp", &[b], None);
+    graph.output = Some(subtract);
+    for (node, position) in graph.nodes.iter_mut().zip([[0.0, -150.0], [0.0, 150.0], [450.0, -100.0], [450.0, 180.0]]) {
+        node.pos = position;
+    }
+    app.run("graph.function.set", json!({"function": graph})).unwrap();
+    app.session.reset_history();
+    let mut harness = harness(app, 1600.0, 960.0);
+    settle(&mut harness, 4);
+    let directory = std::path::PathBuf::from(std::env::var_os("MC_SNAPSHOT_DIR").unwrap());
+    std::fs::create_dir_all(&directory).unwrap();
+    let click = |harness: &mut Harness<'static, MaterialCraftApp>, node, input: &str, button, modifiers| {
+        let curve = harness.state().graph.wires.iter().find(|(wire, _)| wire.0 == NodeId(u64::from(node)) && wire.1 == input).unwrap().1;
+        let position = curve[0].lerp(curve[3], 0.5);
+        harness.event(egui::Event::ModifiersChanged(modifiers));
+        harness.event(egui::Event::PointerMoved(position));
+        harness.step();
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton { pos: position, button, pressed, modifiers });
+            harness.step();
+        }
+        settle(harness, 2);
+    };
+    let query = || By::new().role(egui::accesskit::Role::Button).label("Swap links X");
+    click(&mut harness, subtract, "0", egui::PointerButton::Secondary, egui::Modifiers::NONE);
+    assert!(harness.query(query()).is_none());
+    harness.key_press(egui::Key::Escape);
+    settle(&mut harness, 2);
+    click(&mut harness, subtract, "1", egui::PointerButton::Primary, egui::Modifiers::SHIFT);
+    save(&mut harness, &directory, "function-swap-links-before");
+    click(&mut harness, subtract, "0", egui::PointerButton::Secondary, egui::Modifiers::NONE);
+    assert!(!harness.get(query()).accesskit_node().is_disabled());
+    save(&mut harness, &directory, "function-selected-links-context-menu");
+    harness.get(query()).click();
+    settle(&mut harness, 3);
+    assert_eq!(harness.state().session.graph().unwrap().function.as_ref().unwrap().node(subtract).unwrap().inputs, vec![Some(b), Some(a)]);
+    assert_eq!(harness.state().session.history().len(), 1);
+    save(&mut harness, &directory, "function-swap-links-after");
+    harness.key_press(egui::Key::X);
+    settle(&mut harness, 2);
+    assert_eq!(harness.state().session.graph().unwrap().function.as_ref().unwrap().node(subtract).unwrap().inputs, vec![Some(a), Some(b)]);
+
+    click(&mut harness, subtract, "0", egui::PointerButton::Primary, egui::Modifiers::CTRL);
+    click(&mut harness, interpolation, "0", egui::PointerButton::Primary, egui::Modifiers::SHIFT);
+    click(&mut harness, interpolation, "0", egui::PointerButton::Secondary, egui::Modifiers::NONE);
+    let inspection = materialcraft_ui_egui::control::handle(harness.state_mut(), &egui::Context::default(), "ui.inspect", &json!({}));
+    assert_eq!(inspection["result"]["subgraph"]["selectedWires"], json!([[subtract, "1"], [interpolation, "0"]]));
+    assert!(harness.query(query()).is_none());
+    save(&mut harness, &directory, "function-same-output-links-context-menu");
+    harness.key_press(egui::Key::Escape);
+    settle(&mut harness, 2);
+    let history = harness.state().session.history();
+    let package = harness.state().session.pkg.clone();
+    harness.key_press(egui::Key::X);
+    settle(&mut harness, 2);
+    assert_eq!(harness.state().session.history(), history);
+    assert_eq!(harness.state().session.pkg, package);
+    click(&mut harness, interpolation, "0", egui::PointerButton::Primary, egui::Modifiers::CTRL);
+    click(&mut harness, subtract, "0", egui::PointerButton::Primary, egui::Modifiers::SHIFT);
+
+    click(&mut harness, subtract, "1", egui::PointerButton::Primary, egui::Modifiers::CTRL);
+    click(&mut harness, interpolation, "0", egui::PointerButton::Primary, egui::Modifiers::SHIFT);
+    click(&mut harness, interpolation, "0", egui::PointerButton::Secondary, egui::Modifiers::NONE);
+    harness.get(query()).click();
+    settle(&mut harness, 3);
+    let function = harness.state().session.graph().unwrap().function.as_ref().unwrap();
+    assert_eq!(function.node(subtract).unwrap().inputs, vec![Some(b), Some(b)]);
+    assert_eq!(function.node(interpolation).unwrap().inputs, vec![Some(a)]);
+    save(&mut harness, &directory, "function-cross-node-swap-links-after");
+    harness.key_press(egui::Key::X);
+    settle(&mut harness, 2);
+    let function = harness.state().session.graph().unwrap().function.as_ref().unwrap();
+    assert_eq!(function.node(subtract).unwrap().inputs, vec![Some(a), Some(b)]);
+    assert_eq!(function.node(interpolation).unwrap().inputs, vec![Some(b)]);
+    click(&mut harness, interpolation, "0", egui::PointerButton::Primary, egui::Modifiers::CTRL);
+    click(&mut harness, subtract, "1", egui::PointerButton::Primary, egui::Modifiers::SHIFT);
+
+    let mut graph = harness.state().session.graph().unwrap().function.clone().unwrap();
+    let node = graph.nodes.iter_mut().find(|node| node.id == subtract).unwrap();
+    node.op = "lerp".into();
+    node.inputs.push(Some(a));
+    harness.state_mut().run("graph.function.set", json!({"function": graph})).unwrap();
+    settle(&mut harness, 3);
+    click(&mut harness, subtract, "2", egui::PointerButton::Primary, egui::Modifiers::SHIFT);
+    click(&mut harness, subtract, "0", egui::PointerButton::Secondary, egui::Modifiers::NONE);
+    let inspection = materialcraft_ui_egui::control::handle(harness.state_mut(), &egui::Context::default(), "ui.inspect", &json!({}));
+    assert_eq!(inspection["result"]["subgraph"]["selectedWires"].as_array().unwrap().len(), 3);
+    assert!(harness.query(query()).is_none());
+    save(&mut harness, &directory, "function-three-selected-links-context-menu");
+    harness.key_press(egui::Key::Escape);
+    settle(&mut harness, 2);
+    let history = harness.state().session.history();
+    harness.key_press(egui::Key::X);
+    settle(&mut harness, 2);
+    assert_eq!(harness.state().session.history(), history);
+    assert_eq!(harness.state().session.graph().unwrap().function.as_ref().unwrap(), &graph);
+}
+
+#[test]
+#[ignore = "requires an offscreen GPU; run explicitly with --ignored"]
+fn pattern_links_share_the_pair_context_menu() {
+    use materialcraft_engine::core::{NodeId, PatternGraph, PatternNodeKind, Value};
+
+    let mut app = MaterialCraftApp::headless(materialcraft_engine::new_session(), UiState::default());
+    app.ui.dock.close(materialcraft_ui_egui::docking::Panel::Library);
+    let owner = NodeId(app.run("graph.node.add", json!({"def": "fx_map"})).unwrap()["id"].as_u64().unwrap());
+    let mut graph = PatternGraph::with_root(PatternNodeKind::Switch);
+    let a = graph.add(PatternNodeKind::Quadrant).unwrap();
+    let b = graph.add(PatternNodeKind::Quadrant).unwrap();
+    graph.nodes[0].children = vec![Some(a), Some(b)];
+    for (node, position) in graph.nodes.iter_mut().zip([[0.0, 0.0], [-200.0, 300.0], [200.0, 300.0]]) {
+        node.position = position;
+    }
+    app.run("graph.pattern.set", json!({"id": owner.0, "pattern": graph})).unwrap();
+    let mut harness = harness(app, 1600.0, 960.0);
+    settle(&mut harness, 4);
+    let context = harness.ctx.clone();
+    materialcraft_ui_egui::menus::invoke(harness.state_mut(), &context, "graph.node.edit");
+    settle(&mut harness, 3);
+    for (port, button, modifiers) in [
+        ("output0", egui::PointerButton::Primary, egui::Modifiers::NONE),
+        ("output1", egui::PointerButton::Primary, egui::Modifiers::SHIFT),
+        ("output0", egui::PointerButton::Secondary, egui::Modifiers::NONE),
+    ] {
+        let curve = harness.state().graph.wires.iter().find(|(wire, _)| wire.0 == NodeId(1) && wire.1 == port).unwrap().1;
+        let position = curve[0].lerp(curve[3], 0.5);
+        harness.event(egui::Event::ModifiersChanged(modifiers));
+        harness.event(egui::Event::PointerMoved(position));
+        harness.step();
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton { pos: position, button, pressed, modifiers });
+            harness.step();
+        }
+        settle(&mut harness, 2);
+    }
+    let query = By::new().role(egui::accesskit::Role::Button).label("Swap links X");
+    assert!(!harness.get(query.clone()).accesskit_node().is_disabled());
+    let directory = std::path::PathBuf::from(std::env::var_os("MC_SNAPSHOT_DIR").unwrap());
+    std::fs::create_dir_all(&directory).unwrap();
+    save(&mut harness, &directory, "pattern-selected-links-context-menu");
+    harness.get(query).click();
+    settle(&mut harness, 3);
+    let Value::PatternGraph(swapped) = &harness.state().session.graph().unwrap().node(owner).unwrap().params["pattern"] else { panic!() };
+    assert_eq!(swapped.nodes[0].children, vec![Some(b), Some(a)]);
+    save(&mut harness, &directory, "pattern-swap-links-after");
+}
+
+#[test]
+#[ignore = "requires an offscreen GPU; run explicitly with --ignored"]
+fn incomplete_functions_warn_in_standalone_and_processor_canvases() {
+    use materialcraft_engine::{
+        FunctionGraphTarget,
+        core::{FunctionGraph, NodeId, Value},
+    };
+
+    for definition in ["function", "pixel_processor", "value_processor"] {
+        let mut app = MaterialCraftApp::headless(materialcraft_engine::new_session(), UiState::default());
+        app.ui.dock.close(materialcraft_ui_egui::docking::Panel::Library);
+        let target = if definition == "function" {
+            app.run("file.new", json!({"kind": "function", "name": "Incomplete function"})).unwrap();
+            FunctionGraphTarget::Graph
+        } else {
+            let owner = NodeId(app.run("graph.node.add", json!({"def": definition})).unwrap()["id"].as_u64().unwrap());
+            if definition == "pixel_processor" {
+                app.run("graph.node.param", json!({"id": owner.0, "param": "color_mode", "value": false})).unwrap();
+            }
+            FunctionGraphTarget::Parameter { node: owner, parameter: "function".into() }
+        };
+        let mut graph = FunctionGraph::default();
+        let source = graph.add_constant(Value::Float(0.5));
+        let multiply = graph.add("mul", &[], None);
+        graph.nodes[1].pos = [256.0, 0.0];
+        app.run("graph.function.set", json!({"target": target, "function": graph})).unwrap();
+        let mut harness = harness(app, 1600.0, 960.0);
+        settle(&mut harness, 4);
+        if definition != "function" {
+            let context = harness.ctx.clone();
+            materialcraft_ui_egui::menus::invoke(harness.state_mut(), &context, "graph.node.edit");
+            settle(&mut harness, 3);
+        }
+        let missing_output = || By::new().label_contains("No output node defined");
+        let missing_source = || By::new().label_contains("Output node has no connected value source");
+        let warning_label = format!("Warnings for {}", harness.state().session.graph().unwrap().name);
+        let explorer_warning = || By::new().label(&warning_label);
+        assert!(harness.query(explorer_warning()).is_some(), "{definition}");
+        assert!(harness.query(missing_output()).is_some(), "{definition}");
+        assert!(harness.query(missing_source()).is_none(), "{definition}");
+        let directory = std::path::PathBuf::from(std::env::var_os("MC_SNAPSHOT_DIR").unwrap());
+        std::fs::create_dir_all(&directory).unwrap();
+        save(&mut harness, &directory, &format!("{definition}-warnings"));
+
+        harness.get(By::new().role(egui::accesskit::Role::Button).label("Multiplication")).click_secondary();
+        settle(&mut harness, 2);
+        harness.get(By::new().role(egui::accesskit::Role::Button).label_contains("Set as output node")).click();
+        settle(&mut harness, 3);
+        assert!(harness.query(missing_output()).is_none());
+        assert!(harness.query(missing_source()).is_some());
+        save(&mut harness, &directory, &format!("{definition}-missing-output-source"));
+        harness
+            .state_mut()
+            .run("graph.function.edit", json!({"target": target, "edit": {"action": "connect", "from": source, "to": multiply, "input": 1}}))
+            .unwrap();
+        settle(&mut harness, 3);
+        assert!(harness.query(missing_source()).is_none());
+        assert!(harness.query(explorer_warning()).is_none());
+        save(&mut harness, &directory, &format!("{definition}-partial-output-with-source"));
+        harness.state_mut().run("edit.undo", json!({})).unwrap();
+        settle(&mut harness, 3);
+        assert!(harness.query(missing_source()).is_some());
+        assert!(harness.query(explorer_warning()).is_some());
+        harness.state_mut().run("file.new", json!({"kind": "function", "name": "Another graph"})).unwrap();
+        settle(&mut harness, 3);
+        assert!(harness.query(explorer_warning()).is_some());
+    }
+}
+
+#[test]
+#[ignore = "requires an offscreen GPU; run explicitly with --ignored"]
+fn output_menu_and_package_warnings_follow_parameter_types() {
+    use materialcraft_engine::{
+        FunctionGraphTarget,
+        core::{FunctionGraph, NodeId, Value},
+    };
+
+    let mut app = MaterialCraftApp::headless(materialcraft_engine::new_session(), UiState::default());
+    app.ui.dock.close(materialcraft_ui_egui::docking::Panel::Library);
+    let owner = NodeId(app.run("graph.node.add", json!({"def": "pixel_processor", "params": {"color_mode": false}})).unwrap()["id"].as_u64().unwrap());
+    let target = FunctionGraphTarget::Parameter { node: owner, parameter: "function".into() };
+    let mut function = FunctionGraph::default();
+    function.add_constant(Value::Float3([0.5; 3]));
+    let scalar = function.add_constant(Value::Float(0.5));
+    function.nodes[1].pos = [280.0, 0.0];
+    app.run("graph.function.set", json!({"target": target, "function": function})).unwrap();
+    let package_warning_label = format!("Warnings for {}*", app.session.pkg.name);
+    let mut harness = harness(app, 1600.0, 960.0);
+    settle(&mut harness, 4);
+    let context = harness.ctx.clone();
+    materialcraft_ui_egui::menus::invoke(harness.state_mut(), &context, "graph.node.edit");
+    settle(&mut harness, 3);
+    assert!(harness.query(By::new().label("Expected output: Float")).is_some());
+    assert!(harness.query(By::new().label(&package_warning_label)).is_some());
+    harness.get(By::new().role(egui::accesskit::Role::Button).label("Float3")).click_secondary();
+    settle(&mut harness, 3);
+    assert!(harness.get(By::new().role(egui::accesskit::Role::Button).label("Set as output node")).accesskit_node().is_disabled());
+    let directory = std::path::PathBuf::from(std::env::var_os("MC_SNAPSHOT_DIR").unwrap());
+    std::fs::create_dir_all(&directory).unwrap();
+    save(&mut harness, &directory, "incompatible-function-output");
+    harness.event(egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE });
+    settle(&mut harness, 3);
+    harness.state_mut().run("graph.function.edit", json!({"target": target, "edit": {"action": "output", "id": scalar}})).unwrap();
+    settle(&mut harness, 3);
+    assert!(harness.query(By::new().label(&package_warning_label)).is_none());
+    harness.state_mut().run("graph.node.param", json!({"id": owner.0, "param": "color_mode", "value": true})).unwrap();
+    settle(&mut harness, 3);
+    assert!(harness.query(By::new().label("Expected output: Float4")).is_some());
+    assert!(harness.query(By::new().label_contains("Output node returns Float; expected Float4")).is_some());
+    assert!(harness.query(By::new().label(&package_warning_label)).is_some());
+    save(&mut harness, &directory, "changed-function-output-type");
+    harness.state_mut().run("edit.undo", json!({})).unwrap();
+    settle(&mut harness, 3);
+    assert!(harness.query(By::new().label(&package_warning_label)).is_none());
+}
+
+#[test]
+#[ignore = "requires an offscreen GPU; run explicitly with --ignored"]
+fn explorer_disclosure_tracks_input_and_output_entries() {
+    let mut app = MaterialCraftApp::headless(materialcraft_engine::new_session(), UiState::default());
+    app.session.pkg.graphs[0].name = "Graph entries".into();
+    app.ui.dock.close(materialcraft_ui_egui::docking::Panel::Library);
+    app.run("graph.node.add", json!({"def": "uniform"})).unwrap();
+    let mut harness = harness(app, 1600.0, 960.0);
+    settle(&mut harness, 4);
+    let directory = std::path::PathBuf::from(std::env::var_os("MC_SNAPSHOT_DIR").unwrap());
+    std::fs::create_dir_all(&directory).unwrap();
+    let arrow_visible = |harness: &mut Harness<'static, MaterialCraftApp>| {
+        let name = &harness.state().session.graph().unwrap().name;
+        let row = harness.get(By::new().role(egui::accesskit::Role::TreeItem).label(name)).rect();
+        let image = harness.render().unwrap();
+        // The disclosure gutter contains a light triangle only when the graph has children
+        ((row.left() as u32 - 16)..(row.left() as u32 - 2))
+            .any(|x| ((row.top() as u32 + 3)..(row.bottom() as u32 - 3)).any(|y| image.get_pixel(x, y).0[..3].iter().all(|channel| *channel > 150)))
+    };
+    assert!(!arrow_visible(&mut harness));
+    save(&mut harness, &directory, "explorer-no-inputs-or-outputs");
+
+    for definition in ["input_color", "input_grayscale", "input_value", "output"] {
+        harness.state_mut().run("graph.node.add", json!({"def": definition})).unwrap();
+        settle(&mut harness, 3);
+        assert!(arrow_visible(&mut harness), "{definition}");
+        if definition == "output" {
+            save(&mut harness, &directory, "explorer-with-output");
+        }
+        harness.state_mut().run("edit.delete", json!({})).unwrap();
+        settle(&mut harness, 3);
+        assert!(!arrow_visible(&mut harness), "{definition}");
+        harness.state_mut().run("edit.undo", json!({})).unwrap();
+        settle(&mut harness, 3);
+        assert!(arrow_visible(&mut harness), "{definition}");
+        harness.state_mut().run("edit.redo", json!({})).unwrap();
+        settle(&mut harness, 3);
+        assert!(!arrow_visible(&mut harness), "{definition}");
+    }
+    harness.state_mut().run("file.new", json!({"kind": "function", "name": "Function leaf"})).unwrap();
+    let function = materialcraft_engine::core::FunctionGraph::constant(materialcraft_engine::core::Value::Float(0.5));
+    harness.state_mut().run("graph.function.set", json!({"function": function})).unwrap();
+    settle(&mut harness, 3);
+    assert!(!arrow_visible(&mut harness));
+    save(&mut harness, &directory, "explorer-function-leaf");
+}
+
+#[test]
+#[ignore = "requires an offscreen GPU; run explicitly with --ignored"]
+fn explorer_open_targets_the_clicked_graph() {
     let mut app = MaterialCraftApp::headless(materialcraft_engine::sample_session(), UiState::default());
     app.run("graph.duplicate", json!({"graph": 0}));
     app.session.pkg.graphs[1].name = "Export target".into();
@@ -43,13 +647,13 @@ fn explorer_export_opens_the_clicked_graph() {
     settle(&mut h, 5);
     h.get_by_label("Export target").click_secondary();
     settle(&mut h, 3);
-    h.get_all(By::new().label("Export outputs...")).last().unwrap().click();
+    h.get(By::new().role(egui::accesskit::Role::Button).label("Open")).click();
     settle(&mut h, 3);
     assert_eq!(h.state().session.graph, 1);
-    assert!(h.state().ui.windows.export);
+    assert!(!h.state().ui.windows.export);
     if let Some(dir) = std::env::var_os("MC_SNAPSHOT_DIR").map(std::path::PathBuf::from) {
         std::fs::create_dir_all(&dir).unwrap();
-        save(&mut h, &dir, "explorer-export");
+        save(&mut h, &dir, "explorer-open");
     }
 }
 
@@ -241,12 +845,50 @@ fn graph_context_menu_has_flat_node_list() {
 
     harness.get_by_label("Add node").click();
     settle(&mut harness, 3);
+    let primitive_labels = [
+        "Bitmap",
+        "Blend",
+        "Blur",
+        "Channels shuffle",
+        "Curve",
+        "Directional blur",
+        "Directional warp",
+        "Distance",
+        "Emboss",
+        "FX-Map",
+        "Gradient (Dynamic)",
+        "Gradient map",
+        "Grayscale conversion",
+        "HSL",
+        "Levels",
+        "Normal",
+        "Pixel processor",
+        "SVG",
+        "Sharpen",
+        "Text",
+        "Transformation 2D",
+        "Uniform color",
+        "Value processor",
+        "Warp",
+        "Input color",
+        "Input grayscale",
+        "Input value",
+        "Output",
+    ];
+    if let Some(directory) = &directory {
+        save(&mut harness, directory, "unfiltered-add-node-menu");
+    }
+    assert_node_menu_order(&harness, &primitive_labels);
+    assert_eq!(
+        materialcraft_engine::nodes::catalog().iter().filter(|definition| definition.id != "dot").map(|definition| definition.label).collect::<Vec<_>>(),
+        primitive_labels
+    );
     harness.key_press(egui::Key::S);
     settle(&mut harness, 3);
     let button = |label| By::new().role(egui::accesskit::Role::Button).label(label);
     assert!(!harness.get_all(button("SVG")).last().unwrap().accesskit_node().is_disabled());
     assert!(!harness.get_all(button("Sharpen")).last().unwrap().accesskit_node().is_disabled());
-    assert!(harness.get_all(button("Grayscale Conversion")).last().unwrap().accesskit_node().is_disabled());
+    assert!(harness.get_all(button("Grayscale conversion")).last().unwrap().accesskit_node().is_disabled());
     if let Some(directory) = &directory {
         save(&mut harness, directory, "flat-add-node-menu");
     }
@@ -254,7 +896,7 @@ fn graph_context_menu_has_flat_node_list() {
     let before_clear = harness.state().session.pkg.clone();
     harness.key_press(egui::Key::Backspace);
     settle(&mut harness, 3);
-    assert!(!harness.get_all(button("Grayscale Conversion")).last().unwrap().accesskit_node().is_disabled());
+    assert!(!harness.get_all(button("Grayscale conversion")).last().unwrap().accesskit_node().is_disabled());
     assert_eq!(harness.state().session.pkg, before_clear);
 
     for _ in 0..2 {
@@ -364,6 +1006,7 @@ fn graph_context_menu_has_flat_node_list() {
     settle(&mut harness, 3);
     harness.get_by_label("Add node").click();
     settle(&mut harness, 3);
+    assert_node_menu_order(&harness, &["Quadrant", "Switch", "Iterate"]);
     harness.key_press(egui::Key::S);
     settle(&mut harness, 3);
     if let Some(directory) = &directory {
@@ -467,10 +1110,18 @@ fn annotations_and_function_graph_creation() {
     save(&mut harness, &directory, "function-context-menu");
     harness.get_by_label("Add node").click();
     settle(&mut harness, 3);
-    for label in ["Float", "Float2", "Multiply", "While loop"] {
+    for label in ["Float", "Float2", "Multiplication", "Division", "Ceil", "Vector Float2", "Swizzle Integer1", "To Float", "If...Else", "While loop"] {
         assert!(harness.query_all(By::new().label(label)).next().is_some(), "missing {label}");
     }
+    let labels: Vec<_> = materialcraft_engine::nodes::function::FUNCTIONS
+        .iter()
+        .filter(|definition| definition.id != "passthrough")
+        .map(|definition| definition.label)
+        .collect();
+    assert_eq!(labels.len(), 84);
+    assert!(harness.query(By::new().role(egui::accesskit::Role::Button).label("Dot")).is_none());
     save(&mut harness, &directory, "flat-function-node-menu");
+    assert_node_menu_order(&harness, &labels);
 }
 
 #[test]
@@ -495,7 +1146,7 @@ fn function_cards_and_dot_share_the_regular_graph_style() {
     let directory = std::path::PathBuf::from(std::env::var_os("MC_SNAPSHOT_DIR").unwrap());
     std::fs::create_dir_all(&directory).unwrap();
     save(&mut harness, &directory, "function-cards-and-dot");
-    harness.get_all(By::new().role(egui::accesskit::Role::Button).label("Multiply")).last().unwrap().click();
+    harness.get_all(By::new().role(egui::accesskit::Role::Button).label("Multiplication")).last().unwrap().click();
     settle(&mut harness, 3);
     let blank = harness.state().graph.view.left_bottom() + vec2(12.0, -12.0);
     click_canvas(&mut harness, blank);
@@ -536,7 +1187,7 @@ fn click_canvas(harness: &mut Harness<'static, MaterialCraftApp>, position: egui
 
 #[test]
 #[ignore = "requires an offscreen GPU; run explicitly with --ignored"]
-fn named_outputs_open_properties_and_preview_only_on_double_click() {
+fn named_outputs_select_without_loading_and_open_on_double_click() {
     let mut app = MaterialCraftApp::headless(materialcraft_engine::new_session(), UiState::default());
     let source = app.run("graph.node.add", json!({"def": "uniform", "at": [0, 0]})).unwrap()["id"].as_u64().unwrap();
     let output = app
@@ -550,6 +1201,7 @@ fn named_outputs_open_properties_and_preview_only_on_double_click() {
         .as_u64()
         .unwrap();
     app.run("view.2d", json!({"node": source})).unwrap();
+    app.run("graph.select", json!({"ids": [source]})).unwrap();
     app.session.cook();
     let material = app.session.material_maps().into_iter().map(|(name, image)| (name, image.data.clone())).collect::<Vec<_>>();
     let view3d = serde_json::to_value(&app.session.view3d).unwrap();
@@ -558,14 +1210,13 @@ fn named_outputs_open_properties_and_preview_only_on_double_click() {
     let query = By::new().role(egui::accesskit::Role::TreeItem).label("Base Color");
     let position = harness.get(query.clone()).rect().center();
     click_canvas(&mut harness, position);
-    assert_eq!(harness.state().session.selection, vec![materialcraft_engine::core::NodeId(output)]);
+    assert_eq!(harness.state().session.selection, vec![materialcraft_engine::core::NodeId(source)]);
     assert_eq!(harness.state().session.view2d.node, Some(materialcraft_engine::core::NodeId(source)));
-    assert!(harness.query_all(By::new().label("Identifier")).next().is_some());
     assert!(!harness.state().graph.ports.iter().any(|port| port.node.0 == output && port.output));
 
     let directory = std::path::PathBuf::from(std::env::var_os("MC_SNAPSHOT_DIR").unwrap());
     std::fs::create_dir_all(&directory).unwrap();
-    save(&mut harness, &directory, "named-output-properties");
+    save(&mut harness, &directory, "named-output-selection");
     let start = harness.ctx.input(|input| input.time) + 1.0;
     for (index, pressed) in [true, false, true, false].into_iter().enumerate() {
         harness.input_mut().time = Some(start + index as f64 * 0.05);
@@ -574,6 +1225,8 @@ fn named_outputs_open_properties_and_preview_only_on_double_click() {
     }
     settle(&mut harness, 3);
     assert_eq!(harness.state().session.view2d.node, Some(materialcraft_engine::core::NodeId(output)));
+    assert_eq!(harness.state().session.selection, vec![materialcraft_engine::core::NodeId(output)]);
+    assert!(harness.query_all(By::new().label("Identifier")).next().is_some());
     assert_eq!(serde_json::to_value(&harness.state().session.view3d).unwrap(), view3d);
     let current = harness.state().session.material_maps().into_iter().map(|(name, image)| (name, image.data.clone())).collect::<Vec<_>>();
     assert_eq!(current, material);
@@ -721,17 +1374,22 @@ fn embedded_function_toolbar_and_panels_share_the_active_target() {
         save(&mut harness, &directory, &format!("{definition}-inline-function"));
         harness.state_mut().ui.library_search = "Sample".into();
         settle(&mut harness, 2);
-        for label in ["Sample grayscale", "Sample color"] {
+        for label in ["Sample gray", "Sample color"] {
             assert_eq!(harness.query_all(By::new().label(label)).next().is_some(), definition == "pixel_processor");
         }
         harness.get(By::new().role(egui::accesskit::Role::Canvas).label("Function Graph")).click_secondary();
         settle(&mut harness, 2);
         harness.get_by_label("Add node").click();
         settle(&mut harness, 2);
-        for label in ["Sample grayscale", "Sample color"] {
+        for label in ["Sample gray", "Sample color"] {
             assert_eq!(harness.query_all(query(label)).next().is_some(), definition == "pixel_processor");
         }
+        let labels: Vec<_> =
+            target.available_operations(&harness.state().session).filter(|operation| operation.id != "passthrough").map(|operation| operation.label).collect();
+        assert_eq!(labels.len(), if definition == "pixel_processor" { 84 } else { 82 });
+        assert!(harness.query(query("Dot")).is_none());
         save(&mut harness, &directory, &format!("{definition}-node-menu"));
+        assert_node_menu_order(&harness, &labels);
         harness.key_press(egui::Key::Escape);
         harness.key_press(egui::Key::Escape);
         settle(&mut harness, 2);
@@ -832,8 +1490,8 @@ fn explorer_inputs_and_graph_drop_share_labels_and_material_assignment() {
     for (id, label) in inputs {
         let row = harness.get(By::new().role(egui::accesskit::Role::TreeItem).label(label));
         assert!(row.rect().left() > graph_row.left());
-        row.click();
-        settle(&mut harness, 3);
+        let position = row.rect().center();
+        double_click(&mut harness, position);
         assert_eq!(harness.state().session.selection, vec![id]);
         assert_eq!(harness.get(By::new().role(egui::accesskit::Role::TextInput).label("Node label")).value().as_deref(), Some(label));
         assert!(harness.query_all(By::new().label("Identifier")).next().is_some());
@@ -851,8 +1509,8 @@ fn explorer_inputs_and_graph_drop_share_labels_and_material_assignment() {
         harness.state_mut().run("edit.undo", json!({})).unwrap();
         assert_eq!(harness.state().session.graph().unwrap().node(id).unwrap(), &before);
     }
-    harness.get(By::new().role(egui::accesskit::Role::TreeItem).label("Base Color")).click();
-    settle(&mut harness, 3);
+    let position = harness.get(By::new().role(egui::accesskit::Role::TreeItem).label("Base Color")).rect().center();
+    double_click(&mut harness, position);
     harness.get(By::new().role(egui::accesskit::Role::ComboBox).label("Component Usage")).click();
     settle(&mut harness, 3);
     harness.get_by_label("Glossiness").scroll_to_me();

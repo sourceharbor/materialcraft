@@ -22,6 +22,8 @@ pub struct MaterialCraftApp {
     /// Embedded graph editors in the main graph panel
     pub pattern_editor: Option<pattern::PatternEditor>,
     pub function_editor: Option<function::FunctionEditor>,
+    pub(crate) inspected_graph: Option<materialcraft_engine::GraphTarget>,
+    pub(crate) graph_property_draft: Option<crate::properties::GraphPropertyDraft>,
     pub(crate) graph_parents: Vec<graph::graph_parent::GraphParent>,
     /// Synthetic input from the control channel, fed to egui on the next frames
     pub input_queue: VecDeque<control::Scripted>,
@@ -38,6 +40,9 @@ pub struct MaterialCraftApp {
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     next_autosave: f64,
     styled: Option<(theme::Brightness, theme::Accent)>,
+    /// Release checks and the update prompt (desktop only)
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) updates_rt: crate::updates_ui::Runtime,
     /// Fallback fonts for Arabic
     pub fonts: fonts::UiFonts,
     /// The icon font is installed (it takes effect on the frame after `set_fonts`)
@@ -72,6 +77,8 @@ impl MaterialCraftApp {
             view3d: view3d::View3dState::default(),
             view2d: view2d::View2dState::default(),
             function_editor: None,
+            inspected_graph: None,
+            graph_property_draft: None,
             graph_parents: Vec::new(),
             pattern_editor: None,
             input_queue: VecDeque::new(),
@@ -84,6 +91,8 @@ impl MaterialCraftApp {
             last_time: 0.0,
             next_autosave,
             styled: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            updates_rt: crate::updates_ui::Runtime::default(),
             fonts: fonts::UiFonts::default(),
             fonts_ready: false,
             ui_gesture_active: false,
@@ -93,8 +102,13 @@ impl MaterialCraftApp {
         app
     }
 
-    /// Push the preferences that live in the session (preview size, 3D camera)
+    /// Push application preferences into the session
     pub fn apply_prefs(&mut self) {
+        self.ui.prefs.history = self.ui.prefs.history.sanitized();
+        if self.session.history_prefs != self.ui.prefs.history {
+            let _ = materialcraft_engine::execute(&mut self.session, "session.history", &serde_json::json!(self.ui.prefs.history));
+        }
+
         if self.session.camera != self.ui.prefs.camera.sanitized() {
             self.session.set_camera_prefs(self.ui.prefs.camera);
         }
@@ -106,9 +120,26 @@ impl MaterialCraftApp {
 
     /// Run an engine command, reporting errors as toasts. Returns the result on success
     pub fn run(&mut self, id: &str, mut params: Value) -> Option<Value> {
+        if id.starts_with("file.")
+            || id.starts_with("package.")
+            || matches!(id, "graph.open" | "graph.delete" | "graph.duplicate" | "folder.remove" | "explorer.paste" | "edit.undo" | "edit.redo")
+        {
+            crate::properties::GraphPropertyDraft::commit(self);
+        }
+
+        if matches!(id, "edit.undo" | "edit.redo") {
+            if params.is_null() {
+                params = serde_json::json!({});
+            }
+            if let Some(parameters) = params.as_object_mut() {
+                parameters.entry("document").or_insert_with(|| Value::from(crate::history::document(self)));
+            }
+        }
+
         if matches!(
             id,
             "graph.node.add"
+                | "graph.instance.add"
                 | "graph.node.move"
                 | "graph.frame.move"
                 | "graph.wire.insertDot"
@@ -131,6 +162,9 @@ impl MaterialCraftApp {
                 if id == "view.previewSize" {
                     self.ui.prefs.preview_size = self.session.preview_size.unwrap_or(0);
                 }
+                if id == "session.history" {
+                    self.ui.prefs.history = self.session.history_prefs;
+                }
                 self.close_subgraph_after(id);
                 if matches!(id, "view.3d.assign" | "view.3d.outputs") {
                     self.ui.dock.focus(docking::Panel::View3d);
@@ -145,11 +179,18 @@ impl MaterialCraftApp {
     }
 
     pub(crate) fn close_subgraph_after(&mut self, command: &str) {
-        if command.starts_with("file.new") || matches!(command, "file.open" | "graph.open" | "graph.delete" | "graph.duplicate") {
+        if command.starts_with("file.new")
+            || command.starts_with("package.")
+            || matches!(command, "file.open" | "file.reload" | "graph.open" | "graph.delete" | "graph.duplicate" | "folder.remove" | "explorer.paste")
+        {
             self.graph.inspected_node = None;
+            self.inspected_graph = None;
+            self.graph_property_draft = None;
             self.graph_parents.clear();
             self.pattern_editor = None;
             self.function_editor = None;
+            self.graph.selected_wires.clear();
+            self.graph.cancel_gesture();
         }
         self.reconcile_editors();
         if (materialcraft_engine::selection_commands::supports(command) || matches!(command, "edit.undo" | "edit.redo"))
@@ -161,6 +202,9 @@ impl MaterialCraftApp {
     }
 
     pub(crate) fn reconcile_editors(&mut self) {
+        if self.inspected_graph.is_some_and(|target| target.get(&self.session).is_err()) {
+            self.inspected_graph = None;
+        }
         if self.function_editor.as_ref().is_some_and(|editor| editor.current(self).is_none()) {
             self.function_editor = None;
         }
@@ -267,6 +311,8 @@ impl MaterialCraftApp {
         cook::drive(self, ctx);
         #[cfg(not(target_arch = "wasm32"))]
         self.autosave(now);
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::updates_ui::tick(self, ctx);
         self.reconcile_editors();
         menus::shortcuts(self, ctx);
         self.toasts.retain(|t| t.until > now);

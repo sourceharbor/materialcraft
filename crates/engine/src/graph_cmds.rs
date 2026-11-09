@@ -2,7 +2,7 @@
 
 use serde_json::{Value as J, json};
 
-use materialcraft_core::{ExposedParameter, MAX_SIZE_LOG2, MIN_SIZE_LOG2, NodeId, OutputFormat, Pin, Value};
+use materialcraft_core::{ExposedParameter, Graph, MAX_SIZE_LOG2, MIN_SIZE_LOG2, NodeId, OutputFormat, Pin, Value};
 
 use crate::commands::{CommandSpec, always, bad, boolp, f32p, has_graph, has_selection, i64p, ids_param, point, strp, u64p};
 use crate::{Result, Session, cmd};
@@ -10,20 +10,19 @@ use crate::{Result, Session, cmd};
 pub(crate) fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!("graph.open", "Open graph", [], None, "{graph: index or name}", always, open),
-        cmd!("graph.rename", "Rename graph", [], None, "{name, graph?}", has_graph, rename),
         cmd!("graph.delete", "Delete graph", [], None, "{graph?}", has_graph, delete),
         cmd!("graph.duplicate", "Duplicate graph", [], None, "{graph?}", has_graph, duplicate),
-        cmd!("graph.size", "Graph size", [], None, "{width, height} in pixels (powers of two, 16..8192) or {log2: [w, h]}", has_graph, size),
-        cmd!("graph.seed", "Random seed", [], None, "{seed}", has_graph, |s, p| {
+        cmd!("graph.size", "Graph size", [], None, "{graph?, document?, width, height} in pixels (powers of two, 16..8192) or {log2: [w, h]}", always, size),
+        cmd!("graph.seed", "Random seed", [], None, "{seed, graph?, document?}", always, |s, p| {
             let seed = i64p(p, "seed").ok_or_else(|| bad("graph.seed", "`seed` is required"))?.clamp(0, i32::MAX as i64) as i32;
-            s.edit_merged("graph.seed", "Random seed", |s| {
-                s.graph_mut()?.seed = seed;
+            let target = crate::GraphTarget::resolve(s, p)?;
+            target.edit_merged(s, &format!("graph.seed:{}:{}", target.document, target.graph), "Random seed", |package| {
+                package.graph_mut(target.graph)?.seed = seed;
                 Ok(J::Null)
             })
         }),
-        cmd!("graph.format", "Output format", [], None, "{format: u8|u16|f16|f32}", has_graph, format),
+        cmd!("graph.format", "Output format", [], None, "{format: u8|u16|f16|f32, graph?, document?}", always, format),
         cmd!("graph.cook", "Compute graph", [], None, "{full?: bool} cooks now; returns per-node timings and errors", has_graph, cook),
-        cmd!("graph.attributes", "Graph attributes", [], None, "{category?, description?, author?, tags?}", has_graph, attributes),
         cmd!("graph.pin.add", "Add Navigation pin", [], None, "{name?, at? [x, y]}", has_graph, pin_add),
         cmd!("graph.pin.delete", "Delete pin", [], None, "{id}", has_graph, pin_delete),
         cmd!(
@@ -31,7 +30,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "Expose parameter",
             [],
             None,
-            "{id, label?, default (a typed value or number), min?, max?, group?, bind?: {node, param}}",
+            "{id (optional with bind: then named after the parameter and kept unique), label?, default (a typed value or number), min?, max?, group?, bind?: {node, param}}",
             has_graph,
             exposed_add
         ),
@@ -86,29 +85,10 @@ fn open(s: &mut Session, p: &J) -> Result<J> {
     Ok(json!({"graph": i, "name": s.pkg.graphs.get(i).map(|g| g.name.clone())}))
 }
 
-fn rename(s: &mut Session, p: &J) -> Result<J> {
-    let i = graph_index(s, p)?;
-    let name = strp(p, "name").map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| bad("graph.rename", "`name` is required"))?.to_string();
-    if s.pkg.graphs.iter().enumerate().any(|(j, g)| j != i && g.name == name) {
-        return Err(bad("graph.rename", format!("a graph is already called `{name}`")));
-    }
-    s.edit("Rename graph", |s| {
-        let old = std::mem::replace(&mut s.pkg.graph_mut(i)?.name, name.clone());
-        // Instances follow the rename
-        for g in &mut s.pkg.graphs {
-            for n in g.nodes.iter_mut().filter(|n| n.def == "graph_instance") {
-                if n.params.get("graph") == Some(&Value::Text(old.clone())) {
-                    n.params.insert("graph".into(), Value::Text(name.clone()));
-                }
-            }
-        }
-        Ok(json!({"name": name}))
-    })
-}
-
 fn delete(s: &mut Session, p: &J) -> Result<J> {
     let i = graph_index(s, p)?;
     s.edit("Delete graph", |s| {
+        s.pkg.folders = s.pkg.folder_paths().into_iter().collect();
         s.pkg.graphs.remove(i);
         if i < s.graph {
             s.graph -= 1;
@@ -129,7 +109,7 @@ fn duplicate(s: &mut Session, p: &J) -> Result<J> {
     let i = graph_index(s, p)?;
     s.edit("Duplicate graph", |s| {
         let mut g = s.pkg.graph(i)?.clone();
-        g.name = s.pkg.unique_graph_name(&g.name);
+        g.name = crate::folder_path::unique(&s.pkg, &g.folder, &g.name);
         s.pkg.graphs.push(g);
         s.graph = s.pkg.graphs.len() - 1;
         s.open_material_preview();
@@ -140,6 +120,7 @@ fn duplicate(s: &mut Session, p: &J) -> Result<J> {
 }
 
 fn size(s: &mut Session, p: &J) -> Result<J> {
+    let target = crate::GraphTarget::resolve(s, p)?;
     let log = |px: u64| 63 - px.clamp(1, 1 << 20).leading_zeros();
     let (w, h) = if let Some(a) = p.get("log2").and_then(J::as_array) {
         (a.first().and_then(J::as_u64).unwrap_or(10) as u32, a.get(1).and_then(J::as_u64).unwrap_or(10) as u32)
@@ -149,13 +130,14 @@ fn size(s: &mut Session, p: &J) -> Result<J> {
     };
 
     let (w, h) = (w.clamp(MIN_SIZE_LOG2, MAX_SIZE_LOG2), h.clamp(MIN_SIZE_LOG2, MAX_SIZE_LOG2));
-    s.edit("Graph size", |s| {
-        s.graph_mut()?.size = [w, h];
+    target.edit(s, "Graph size", |package| {
+        package.graph_mut(target.graph)?.size = [w, h];
         Ok(json!({"width": 1u32 << w, "height": 1u32 << h}))
     })
 }
 
 fn format(s: &mut Session, p: &J) -> Result<J> {
+    let target = crate::GraphTarget::resolve(s, p)?;
     let f = match strp(p, "format") {
         Some("u8" | "8") => OutputFormat::U8,
         Some("u16" | "16") => OutputFormat::U16,
@@ -164,8 +146,8 @@ fn format(s: &mut Session, p: &J) -> Result<J> {
         _ => return Err(bad("graph.format", "`format` is u8, u16, f16 or f32")),
     };
 
-    s.edit("Output format", |s| {
-        s.graph_mut()?.format = f;
+    target.edit(s, "Output format", |package| {
+        package.graph_mut(target.graph)?.format = f;
         Ok(J::Null)
     })
 }
@@ -181,18 +163,6 @@ fn cook(s: &mut Session, p: &J) -> Result<J> {
                    "size": r.outputs.first().and_then(materialcraft_eval::NodeOutput::as_image).map(|i| [i.w, i.h])})
         }).collect::<Vec<_>>(),
     }))
-}
-
-fn attributes(s: &mut Session, p: &J) -> Result<J> {
-    s.edit("Graph attributes", |s| {
-        let a = &mut s.graph_mut()?.attributes;
-        for (k, slot) in [("category", &mut a.category), ("description", &mut a.description), ("author", &mut a.author), ("tags", &mut a.tags)] {
-            if let Some(v) = strp(p, k) {
-                *slot = v.into();
-            }
-        }
-        Ok(J::Null)
-    })
 }
 
 /// Graph-space bounding rect of nodes `ids` (node cards are about 96×110)
@@ -225,12 +195,21 @@ fn pin_delete(s: &mut Session, p: &J) -> Result<J> {
 }
 
 fn exposed_add(s: &mut Session, p: &J) -> Result<J> {
-    let id = strp(p, "id").map(str::trim).filter(|i| !i.is_empty()).ok_or_else(|| bad("graph.exposed.add", "`id` is required"))?.to_string();
-    if s.graph()?.exposed.iter().any(|e| e.id == id) {
-        return Err(bad("graph.exposed.add", format!("an input is already called `{id}`")));
-    }
     // From a bound node parameter: its value, range and options become the input's
     let bind = p.get("bind").and_then(|b| Some((NodeId(b.get("node")?.as_u64()?), b.get("param")?.as_str()?.to_string())));
+    let id = match strp(p, "id").map(str::trim).filter(|i| !i.is_empty()) {
+        Some(id) => {
+            if s.graph()?.exposed.iter().any(|e| e.id == id) {
+                return Err(bad("graph.exposed.add", format!("an input is already called `{id}`")));
+            }
+            id.to_string()
+        }
+        // Without an `id`, a bound input is named after its parameter, kept unique across nodes
+        None => {
+            let (_, param) = bind.as_ref().ok_or_else(|| bad("graph.exposed.add", "`id` is required"))?;
+            unique_exposed_id(s.graph()?, param)
+        }
+    };
     let mut default = Value::Float(0.5);
     let (mut min, mut max, mut options) = (0.0f32, 1.0f32, Vec::new());
     if let Some((node, param)) = &bind {
@@ -264,6 +243,15 @@ fn exposed_add(s: &mut Session, p: &J) -> Result<J> {
         }
         Ok(json!({"id": id}))
     })
+}
+
+/// An input id not used in `graph`: `base`, `base_1`, `base_2`…
+fn unique_exposed_id(graph: &Graph, base: &str) -> String {
+    let taken = |id: &str| graph.exposed.iter().any(|e| e.id == id);
+    if !taken(base) {
+        return base.to_string();
+    }
+    (1..).map(|i| format!("{base}_{i}")).find(|id| !taken(id)).unwrap_or_else(|| base.to_string())
 }
 
 fn exposed_set(s: &mut Session, p: &J) -> Result<J> {
@@ -359,9 +347,9 @@ fn select_stream(s: &mut Session, p: &J, up: bool) -> Result<J> {
 
 fn from_selection(s: &mut Session, p: &J) -> Result<J> {
     let ids = ids_param(s, "graph.createFromSelection", p)?;
-    let base = strp(p, "name").unwrap_or("Sub_graph").to_string();
+    let base = crate::folder_path::name(strp(p, "name").unwrap_or("Sub_graph"))?;
     s.edit("Create graph from selection", |s| {
-        let name = s.pkg.unique_graph_name(&base);
+        let name = crate::folder_path::unique(&s.pkg, "", base);
         let src = s.graph()?.clone();
         let mut sub = materialcraft_core::Graph::new(&name);
         sub.size = src.size;
@@ -392,6 +380,9 @@ fn from_selection(s: &mut Session, p: &J) -> Result<J> {
             sub.node_mut(id)?.params.extend([("identifier".to_string(), Value::Text(ident.clone())), ("usage".to_string(), Value::Enum(usage))]);
             sub.connect(c.from, &c.from_port, id, "input")?;
             outputs.push((c.from, c.from_port.clone(), ident));
+        }
+        if !sub.nodes.iter().any(|node| node.def == "output") {
+            return Err(bad("graph.createFromSelection", "the selection needs an output node or an outgoing connection before it can become an instance"));
         }
         s.pkg.graphs.push(sub);
         let g = s.graph_mut()?;

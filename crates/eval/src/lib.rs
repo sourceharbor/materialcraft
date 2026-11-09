@@ -17,6 +17,8 @@ mod parameter;
 mod port;
 mod ports;
 mod prepared_graph;
+mod resolved_base_parameters;
+mod resource_decoder;
 mod time;
 mod value_execution;
 mod value_input_label;
@@ -32,6 +34,7 @@ pub use node_size::node_size;
 pub use options::Options;
 pub use port::Port;
 pub use ports::{identifier, instance_graph, ports, ports_with_connections};
+pub use resource_decoder::ResourceDecoder;
 pub use time::now_ms;
 pub use value_input_label::value_input_label;
 

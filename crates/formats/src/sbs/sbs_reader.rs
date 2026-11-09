@@ -48,6 +48,20 @@ impl<'text> SbsReader<'text, '_> {
                 match item.tag_name().name() {
                     "graph" | "function" => graphs.push((path, item)),
                     "group" => {
+                        if identifier.is_empty() || identifier.contains('/') {
+                            self.warnings.add(format!("invalid folder `{path}` was flattened"));
+                            if let Some(group_content) = child_element(item, "content") {
+                                pending.push((folder.clone(), group_content));
+                            }
+                            continue;
+                        }
+
+                        if path.split('/').count() > 64 {
+                            self.warnings.add(format!("excessively nested folder `{path}` was skipped"));
+                            continue;
+                        }
+
+                        pkg.folders.push(path.clone());
                         if let Some(group_content) = child_element(item, "content") {
                             pending.push((path, group_content));
                         }
@@ -66,6 +80,11 @@ impl<'text> SbsReader<'text, '_> {
         let kind = child_value(item, "type").unwrap_or("bitmap");
         let format = child_value(item, "format").unwrap_or("png").trim().to_ascii_lowercase();
         let source = child_element(item, "source");
+        let external = source
+            .and_then(|source| child_element(source, "externalcopy"))
+            .and_then(|copy| child_value(copy, "filename"))
+            .filter(|path| !path.is_empty())
+            .or_else(|| child_value(item, "filepath"));
         let mut bytes: Option<Vec<u8>> = None;
         let mut why_missing = String::new();
 
@@ -79,7 +98,7 @@ impl<'text> SbsReader<'text, '_> {
         if bytes.is_none() {
             let external_copy = source.and_then(|s| child_element(s, "externalcopy")).and_then(|e| child_value(e, "filename"));
             for file in [external_copy, child_value(item, "filepath")].into_iter().flatten().filter(|p| !p.trim().is_empty()) {
-                if file.contains("://") {
+                if file.contains("://") && !file.starts_with("sbs://") {
                     why_missing = format!("it links to `{file}`, which is not available");
                     continue;
                 }
@@ -102,11 +121,17 @@ impl<'text> SbsReader<'text, '_> {
                 self.resource_bytes += data.len();
                 let ext = if kind == "svg" { "svg".to_string() } else { format };
 
-                pkg.resources.push(Resource::new(name.clone(), crate::safe_file_name(&format!("{name}.{ext}")), ResourceBytes::new(data)));
+                let mut resource = Resource::new(name.clone(), crate::safe_file_name(&format!("{name}.{ext}")), ResourceBytes::new(data));
+                resource.folder = path.rsplit_once('/').map_or("", |(folder, _)| folder).into();
+                pkg.resources.push(resource);
             }
             None => {
                 let why = if why_missing.is_empty() { "it has no data".to_string() } else { why_missing };
-
+                let extension = if kind == "svg" { "svg" } else { &format };
+                let mut resource = Resource::new(name.clone(), crate::safe_file_name(&format!("{name}.{extension}")), ResourceBytes::new(Vec::new()));
+                resource.source = external.unwrap_or("").into();
+                resource.folder = path.rsplit_once('/').map_or("", |(folder, _)| folder).into();
+                pkg.resources.push(resource);
                 self.warnings.add(format!("resource `{path}` could not be loaded: {why}"));
             }
         }
@@ -121,7 +146,12 @@ impl<'text> SbsReader<'text, '_> {
 
     pub(super) fn read_graph(&mut self, element: XmlNode<'_, 'text>, name: String) -> Graph {
         let mut graph = Graph::new(&name);
-        graph.seed = read_base_params(child_element(element, "baseParameters")).seed;
+        let base = read_base_params(child_element(element, "baseParameters"));
+        graph.seed = base.seed;
+        graph.pixel_ratio = base.pixel_ratio;
+        graph.pixel_ratio_mode = base.pixel_ratio_mode;
+        graph.tiling = base.tiling;
+        graph.tiling_mode = base.tiling_mode;
 
         // The default parent size option ("11x11", log2 sizes)
         for option in child_element(element, "options").into_iter().flat_map(|o| children_named(o, "option")) {
@@ -135,14 +165,21 @@ impl<'text> SbsReader<'text, '_> {
         }
 
         if let Some(attributes) = child_element(element, "attributes") {
-            let text = |tag: &str| child_value(attributes, tag).unwrap_or("").to_string();
-            graph.attributes.category = text("category");
-            graph.attributes.description = text("description");
-            graph.attributes.author = text("author");
-            graph.attributes.tags = text("tags");
+            graph.attributes = super::graph_attributes::read(attributes);
+            if let Some(size) = child_value(attributes, "physicalSize") {
+                let mut components = size.split_whitespace().map(str::parse::<f32>);
+                if let (Some(Ok(x)), Some(Ok(y)), Some(Ok(z)), None) = (components.next(), components.next(), components.next(), components.next())
+                    && [x, y, z].iter().all(|component| component.is_finite() && *component >= 0.0)
+                {
+                    graph.physical_size = [x, y, z];
+                } else {
+                    self.warnings.add(format!("graph `{name}` has an invalid physical size"));
+                }
+            }
         }
 
         if element.has_tag_name("function") {
+            graph.function_type = child_value(element, "type").and_then(|code| code.parse().ok()).unwrap_or(0);
             self.read_graph_inputs(element, &mut graph);
             let dynamic = child_element(element, "paramValue").and_then(|value| child_element(value, "dynamicValue"));
             let function = dynamic.ok_or_else(|| "missing function body".to_string()).and_then(super::function_graph::read);
@@ -270,7 +307,13 @@ impl<'text> SbsReader<'text, '_> {
                     Some(port) => port,
                     None if to.open_inputs => {
                         if let Some(node) = graph.nodes.get_mut(to.index) {
-                            add_placeholder_input(node, sbs_input);
+                            if let Some(instance) = &mut node.instance {
+                                if !instance.inputs.iter().any(|port| port.identifier == sbs_input) {
+                                    instance.inputs.push(materialcraft_core::GraphPort { identifier: sbs_input.into(), type_code: 1 });
+                                }
+                            } else {
+                                add_placeholder_input(node, sbs_input);
+                            }
                         }
                         sbs_input.to_string()
                     }
@@ -391,6 +434,7 @@ impl<'text> SbsReader<'text, '_> {
         }
     }
     pub(super) fn read_instance(&mut self, graph: &mut Graph, implementation: XmlNode<'_, 'text>, pos: [f32; 2], output_uids: &[(String, bool)]) -> ReadNode {
+        let graph_name = graph.name.clone();
         let (path, dependency) = self.resolve_reference(child_value(implementation, "path").unwrap_or(""));
         let params = child_element(implementation, "parameters");
         let bridgings: Vec<(String, String)> = child_element(implementation, "outputBridgings")
@@ -402,13 +446,42 @@ impl<'text> SbsReader<'text, '_> {
             || params.into_iter().flat_map(|p| children_named(p, "parameter")).filter(|p| !BASE_PARAMS.contains(&child_value(*p, "name").unwrap_or("")));
 
         let own_graph = dependency.as_deref().is_none_or(|d| d == SELF_DEPENDENCY).then(|| self.graph_names.get(&path).cloned()).flatten();
-        if let Some(sub_graph) = own_graph {
+        let external = dependency.as_deref().filter(|file| *file != SELF_DEPENDENCY && file.to_ascii_lowercase().ends_with(".sbs"));
+        if own_graph.is_some() || external.is_some() {
             let (id, index, node) = push_node(graph, "graph_instance", pos);
             if let Some(node) = node {
-                node.params.insert("graph".into(), Value::Text(sub_graph));
+                if let Some(sub_graph) = own_graph {
+                    node.params.insert("graph".into(), Value::Text(sub_graph));
+                } else {
+                    let comp_node = implementation.parent().and_then(|parent| parent.parent());
+                    let types: HashMap<_, _> = comp_node
+                        .and_then(|node| child_element(node, "compOutputs"))
+                        .into_iter()
+                        .flat_map(|outputs| children_named(outputs, "compOutput"))
+                        .map(|output| {
+                            (child_value(output, "uid").unwrap_or(""), child_value(output, "comptype").and_then(|code| code.parse().ok()).unwrap_or(1))
+                        })
+                        .collect();
+                    node.instance = Some(materialcraft_core::GraphInstance {
+                        label: String::new(),
+                        defaults: Default::default(),
+                        package: external.unwrap_or("").into(),
+                        graph: path.clone(),
+                        inputs: Vec::new(),
+                        outputs: bridgings
+                            .iter()
+                            .map(|(uid, identifier)| materialcraft_core::GraphPort {
+                                identifier: identifier.clone(),
+                                type_code: types.get(uid.as_str()).copied().unwrap_or(1),
+                            })
+                            .collect(),
+                    });
+                }
                 for param in instance_params() {
                     if let Some(value) = child_element(param, "paramValue").and_then(sbs_constant) {
                         node.params.insert(child_value(param, "name").unwrap_or("").to_string(), to_natural_value(&value));
+                    } else {
+                        self.set_param(node, child_value(param, "name").unwrap_or(""), &Value::Float(0.0), 0, param, &graph_name);
                     }
                 }
                 node.base = read_base_params(params);

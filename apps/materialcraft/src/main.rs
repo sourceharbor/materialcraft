@@ -71,7 +71,17 @@ fn icon() -> Option<egui::IconData> {
     Some(egui::IconData { rgba: img.into_raw(), width: w, height: h })
 }
 
+/// A scripted run (`--control` or `MATERIALCRAFT_NO_PREFS`) gets no update prompt over the window it drives
+fn checks_for_updates_at_start(control: Option<u16>, throwaway_prefs: bool) -> bool {
+    control.is_none() && !throwaway_prefs
+}
+
 fn main() {
+    // Windows: the update helper is a copy of this program started with `--finish-update`.
+    #[cfg(windows)]
+    if let Some(result) = craft_update::self_update::finish(&materialcraft_ui_egui::UPDATE_APP, &std::env::args_os().skip(1).collect::<Vec<_>>()) {
+        std::process::exit(i32::from(result.is_err()));
+    }
     let args = match parse_args() {
         Ok(Some(a)) => a,
         Ok(None) => return,
@@ -94,13 +104,15 @@ fn main() {
     // Scripted runs (agents, tests) set MATERIALCRAFT_NO_PREFS so they neither read nor overwrite the user's saved layout and settings: state goes to a throwaway file
     let persistence_path =
         std::env::var_os("MATERIALCRAFT_NO_PREFS").map(|_| std::env::temp_dir().join(format!("materialcraft-noprefs-{}.ron", std::process::id())));
-    let options = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Wgpu, persistence_path, ..Default::default() };
     let control = args.control;
+    let startup_update_check = checks_for_updates_at_start(control, persistence_path.is_some());
+    let options = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Wgpu, persistence_path, ..Default::default() };
     let r = eframe::run_native(
         "MaterialCraft",
         options,
         Box::new(move |cc| {
             let mut app = MaterialCraftApp::new(cc, session);
+            app.set_startup_update_check(startup_update_check);
             if let Some(port) = control {
                 app.control = Some(control_server::start(port, cc.egui_ctx.clone()));
             }
@@ -120,6 +132,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_a_run_a_person_started_checks_for_updates_at_start() {
+        assert!(checks_for_updates_at_start(None, false));
+        assert!(!checks_for_updates_at_start(Some(9000), false));
+        assert!(!checks_for_updates_at_start(None, true));
+    }
+
+    #[test]
     fn startup_without_a_file_has_one_empty_graph() {
         let s = initial_session(&Args { file: None, control: None });
         assert_eq!(s.pkg.name, "Untitled package");
@@ -135,15 +154,23 @@ mod tests {
 
     #[test]
     fn startup_opens_the_requested_package() {
-        let path = std::env::temp_dir().join(format!("mc-startup-{}.sbs", std::process::id()));
+        let directory = std::env::temp_dir();
+        let filename = format!("mc-startup-{}.sbs", std::process::id());
+        let path = directory.join(&filename);
         let original = materialcraft_engine::sample_session();
-        std::fs::write(&path, materialcraft_engine::file_cmds::save_bytes(&original).unwrap()).unwrap();
-        let s = initial_session(&Args { file: Some(path.to_string_lossy().into_owned()), control: None });
-        assert_eq!(s.pkg.graphs.len(), original.pkg.graphs.len());
-        assert_eq!(s.pkg.graphs[0].name, original.pkg.graphs[0].name);
-        assert_eq!(materialcraft_engine::file_cmds::save_bytes(&s).unwrap(), materialcraft_engine::file_cmds::save_bytes(&original).unwrap());
-        assert_eq!(s.path.as_deref(), path.to_str());
-        assert!(!s.modified);
+        let bytes = materialcraft_engine::file_cmds::save_bytes(&original).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let canonical = path.canonicalize().unwrap();
+
+        // Startup stores the canonical path, including expanded short names on Windows
+        for requested in [path.clone(), directory.join(".").join(&filename)] {
+            let session = initial_session(&Args { file: Some(requested.to_string_lossy().into_owned()), control: None });
+            assert_eq!(session.pkg.graphs.len(), original.pkg.graphs.len());
+            assert_eq!(session.pkg.graphs[0].name, original.pkg.graphs[0].name);
+            assert_eq!(materialcraft_engine::file_cmds::save_bytes(&session).unwrap(), bytes);
+            assert_eq!(session.path.as_deref(), canonical.to_str());
+            assert!(!session.modified);
+        }
         std::fs::remove_file(path).unwrap();
     }
 }
